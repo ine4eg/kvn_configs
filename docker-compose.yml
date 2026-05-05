@@ -15,11 +15,11 @@ services:
       OUTPUT_DIR: "/data"
       API_PORT: "29000"
     dns:
-      - 1.1.1.1
-      - 8.8.8.8
-    sysctls:
-      - net.ipv6.conf.all.disable_ipv6=1
-      - net.ipv6.conf.default.disable_ipv6=1
+      - 77.88.8.8
+      # - 8.8.8.8
+    # sysctls:
+    #   - net.ipv6.conf.all.disable_ipv6=1
+    #   - net.ipv6.conf.default.disable_ipv6=1
     security_opt:
       - no-new-privileges:false
     cap_add:
