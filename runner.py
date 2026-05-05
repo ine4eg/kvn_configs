@@ -492,10 +492,13 @@ def save_working_configs(results):
         return 0
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(WORKING_FILE, "w", encoding="utf-8") as f:
+    with open(WORKING_FILE, "w") as f:
         f.write("#profile-title: filtered working configs\n")
         f.write("#profile-update-interval: 48\n")
-        f.write("#support-url: https://t.me/rjsxrd\n\n")
+        f.write("#support-url: https://t.me/rjsxrd\n")
+        f.write("#announce: t.me/rjsxrd\n")
+        f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
+
         for r in ok:
             f.write(r["uri"].strip() + "\n")
 
