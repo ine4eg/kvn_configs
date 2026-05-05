@@ -485,6 +485,30 @@ async def run_ping_test(configs):
     await asyncio.gather(*[bounded(uri, i) for i, uri in enumerate(configs)])
     return results
 
+# Добавьте эту функцию в раздел общих утилит
+def get_country_by_ip(host):
+    """Получить флаг страны по IP или домену сервера"""
+    try:
+        # Извлекаем IP/домен из URI
+        if '://' in host:
+            host = host.split('://')[1]
+        if '@' in host:
+            host = host.split('@')[1]
+        host = host.split(':')[0].split('?')[0]
+        
+        # Используем ip-api.com для определения страны
+        import urllib.request
+        import json
+        
+        url = f"http://ip-api.com/json/{host}?fields=countryCode"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get('countryCode'):
+                return get_flag(data['countryCode'])
+    except Exception:
+        pass
+    return "🌍"  # флаг по умолчанию, если не удалось определить
 
 def save_working_configs(results):
     ok = sorted([r for r in results if r["ping"] is not None], key=lambda x: x["ping"])
@@ -493,7 +517,7 @@ def save_working_configs(results):
         return 0
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(WORKING_FILE, "w") as f:
+    with open(WORKING_FILE, "w", encoding="utf-8") as f:
         f.write("#profile-title: С высокой скоростью\n")
         f.write("#profile-update-interval: 1\n")
         f.write("#support-url: https://t.me/ine4eg\n")
@@ -501,8 +525,16 @@ def save_working_configs(results):
         f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
 
         for r in ok:
-            # Добавляем метку с пингом к конфигу
-            label = f"{r['label']} [{r['ping']:.0f}ms]"
+            # Получаем протокол
+            proto = protocol_name(r["uri"])
+            
+            # Получаем флаг страны по IP
+            flag = get_country_by_ip(r["uri"])
+            
+            # Создаем красивую метку
+            label = f"{flag} {proto} ping: {r['ping']:.0f}ms"
+            
+            # Пересобираем URI
             rebuilt_uri = rebuild_uri(r["uri"].strip(), label)
             f.write(rebuilt_uri + "\n")
 
