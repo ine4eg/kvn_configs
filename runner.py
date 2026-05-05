@@ -13,7 +13,6 @@ VPN Config Runner
   OUTPUT_DIR     — папка для файлов (default: /data)
 """
 
-import ip3country
 import asyncio
 import base64
 import json
@@ -487,8 +486,11 @@ async def run_ping_test(configs):
     await asyncio.gather(*[bounded(uri, i) for i, uri in enumerate(configs)])
     return results
 
-def get_country_by_ip(host):
-    """Получить флаг страны через ip3country"""
+def get_country_by_ip(host, db_path='/usr/share/GeoIP/GeoLite2-Country.mmdb'):
+    """Получить флаг страны по IP/домену из локальной базы GeoIP"""
+    import geoip2.database
+    import socket
+    
     try:
         # Извлекаем IP из URI
         if '://' in host:
@@ -497,9 +499,14 @@ def get_country_by_ip(host):
             host = host.split('@')[1]
         host = host.split(':')[0].split('?')[0]
         
-        # Определяем страну
-        info = ip3country.country_info(host)
-        return get_flag(info['code'])
+        # Разрешаем домен в IP
+        ip = socket.gethostbyname(host)
+        
+        # Определяем страну по базе
+        with geoip2.database.Reader(db_path) as reader:
+            response = reader.country(ip)
+            # log (response)
+            return get_flag(response.country.iso_code)
     except Exception:
         pass
     return "🌍"

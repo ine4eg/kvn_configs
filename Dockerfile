@@ -22,7 +22,14 @@ RUN ARCH=${TARGETARCH} && \
     rm -rf /tmp/xray /tmp/xray.zip
 
 # Python-зависимости
-RUN pip install --no-cache-dir aiohttp aiohttp-socks ip3country
+RUN pip install --no-cache-dir aiohttp aiohttp-socks geoip2
+
+# Создаем папку для GeoIP базы
+RUN mkdir -p /usr/share/GeoIP
+
+# Скачиваем базу GeoLite2-Country (с официального зеркала)
+RUN wget -q https://git.io/GeoLite2-Country.mmdb -O /usr/share/GeoIP/GeoLite2-Country.mmdb
+
 
 # Папка для результатов
 RUN mkdir -p /data
