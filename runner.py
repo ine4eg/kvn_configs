@@ -533,7 +533,7 @@ def save_working_configs(results):
             flag = get_country_by_ip(r["uri"])
             
             # Создаем красивую метку
-            label = f"{flag} {proto} ping: {r['ping']:.0f}ms"
+            label = f"{flag} {proto} ping: {r['ping']:.0f}ms, t.me/ine4eg"
             
             # Пересобираем URI
             rebuilt_uri = rebuild_uri(r["uri"].strip(), label)
