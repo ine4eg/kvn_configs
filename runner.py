@@ -369,6 +369,8 @@ def stop_xray(proc):
 #  ШАГ 1 — PING-ТЕСТ (vpn_ping_test)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+
 def extract_host_port(config):
     try:
         if '://' in config:
@@ -499,11 +501,13 @@ def save_working_configs(results):
         f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
 
         for r in ok:
-            f.write(r["uri"].strip() + "\n")
+            # Добавляем метку с пингом к конфигу
+            label = f"{r['label']} [{r['ping']:.0f}ms]"
+            rebuilt_uri = rebuild_uri(r["uri"].strip(), label)
+            f.write(rebuilt_uri + "\n")
 
     log(f"[ping] Сохранено {len(ok)} рабочих конфигов -> {WORKING_FILE}")
     return len(ok)
-
 
 async def do_ping_stage():
     log("=" * 60)
