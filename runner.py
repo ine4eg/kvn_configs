@@ -402,20 +402,19 @@ def fetch_configs(url):
         return []
 
     configs = []
-    seen_hosts = set()
     for line in text.splitlines():
         line = line.strip().replace("&amp;", "&")
         if not line or line.startswith("#"):
             continue
         if re.match(r"^(vless|vmess|trojan|ss)://", line):
-            host_port = extract_host_port(line)
-            if host_port and host_port not in seen_hosts:
-                seen_hosts.add(host_port)
-                configs.append(line)
-            elif not host_port:
-                configs.append(line)
-
-    log(f"[ping] Найдено конфигов: {len(configs)} (уникальных хостов: {len(seen_hosts)})")
+            cleaned = clean_url(line)
+            if cleaned and len(cleaned) > 20:
+                configs.append(cleaned)
+    
+    # Удаляем дубликаты
+    configs = list(dict.fromkeys(configs))
+    
+    log(f"[ping] Найдено конфигов: {len(configs)}")
     return configs
 
 
@@ -493,10 +492,10 @@ def save_working_configs(results):
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(WORKING_FILE, "w") as f:
-        f.write("#profile-title: filtered working configs\n")
-        f.write("#profile-update-interval: 48\n")
-        f.write("#support-url: https://t.me/rjsxrd\n")
-        f.write("#announce: t.me/rjsxrd\n")
+        f.write("#profile-title: С высокой скоростью\n")
+        f.write("#profile-update-interval: 1\n")
+        f.write("#support-url: https://t.me/ine4eg\n")
+        f.write("#announce: t.me/ine4eg\n")
         f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
 
         for r in ok:
@@ -716,6 +715,11 @@ async def do_speed_stage():
     if results:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         with open(TESTED_FILE, "w", encoding="utf-8") as f:
+            f.write("#profile-title: С высокой скоростью\n")
+            f.write("#profile-update-interval: 1\n")
+            f.write("#support-url: https://t.me/ine4eg\n")
+            f.write("#announce: t.me/ine4eg\n")
+            f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
             for r in results:
                 f.write(r + "\n")
         log(f"[speed] Готово! Найдено {len(results)} быстрых конфигов — {TESTED_FILE}")
