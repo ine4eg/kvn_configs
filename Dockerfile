@@ -22,7 +22,7 @@ RUN ARCH=${TARGETARCH} && \
     rm -rf /tmp/xray /tmp/xray.zip
 
 # Python-зависимости
-RUN pip install --no-cache-dir aiohttp aiohttp-socks
+RUN pip install --no-cache-dir aiohttp aiohttp-socks ip3country
 
 # Папка для результатов
 RUN mkdir -p /data

@@ -13,6 +13,7 @@ VPN Config Runner
   OUTPUT_DIR     — папка для файлов (default: /data)
 """
 
+import ip3country
 import asyncio
 import base64
 import json
@@ -486,30 +487,22 @@ async def run_ping_test(configs):
     await asyncio.gather(*[bounded(uri, i) for i, uri in enumerate(configs)])
     return results
 
-# Добавьте эту функцию в раздел общих утилит
 def get_country_by_ip(host):
-    """Получить флаг страны по IP или домену сервера"""
+    """Получить флаг страны через ip3country"""
     try:
-        # Извлекаем IP/домен из URI
+        # Извлекаем IP из URI
         if '://' in host:
             host = host.split('://')[1]
         if '@' in host:
             host = host.split('@')[1]
         host = host.split(':')[0].split('?')[0]
         
-        # Используем ip-api.com для определения страны
-        import urllib.request
-        import json
-        
-        url = f"http://ip-api.com/json/{host}?fields=countryCode"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode())
-            if data.get('countryCode'):
-                return get_flag(data['countryCode'])
+        # Определяем страну
+        info = ip3country.country_info(host)
+        return get_flag(info['code'])
     except Exception:
         pass
-    return "🌍"  # флаг по умолчанию, если не удалось определить
+    return "🌍"
 
 def save_working_configs(results):
     ok = sorted([r for r in results if r["ping"] is not None], key=lambda x: x["ping"])
