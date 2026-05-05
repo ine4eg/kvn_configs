@@ -1,0 +1,43 @@
+services:
+  vpn-runner:
+    build: .
+    container_name: vpn-runner
+    restart: unless-stopped
+    # Пробрасываем порт для cloudflared
+    ports:
+      - "29000:29000"
+    volumes:
+      - ./data:/data
+    environment:
+      CONFIG_URL: "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt"
+      XRAY_BIN: "xray"
+      RUN_INTERVAL: "3600"
+      OUTPUT_DIR: "/data"
+      API_PORT: "29000"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    security_opt:
+      - no-new-privileges:false
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - vpn-network
+
+  # localtunnel:
+  #   image: node:18-alpine
+  #   container_name: localtunnel
+  #   restart: unless-stopped
+  #   command: npx localtunnel --port 29000 --host https://localtunnel.me
+  #   depends_on:
+  #     - vpn-runner
+  #   networks:
+  #     - vpn-network
+    # Не нужно пробрасывать порты, localtunnel сам создает публичный URL
+
+networks:
+  vpn-network:
+    driver: bridge
