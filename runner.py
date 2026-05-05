@@ -395,14 +395,15 @@ def extract_host_port(config):
 
 def fetch_configs(url):
     log(f"[ping] Загрузка конфигов: {url}")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        log(f"[ping] Ошибка загрузки: {e}")
-        return []
-
+        
+    while True:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+                break
+        except Exception as e:
+            log(f"[ping] Ошибка загрузки: {e}")
     configs = []
     for line in text.splitlines():
         line = line.strip().replace("&amp;", "&")
@@ -518,7 +519,7 @@ def save_working_configs(results):
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(WORKING_FILE, "w", encoding="utf-8") as f:
-        f.write("#profile-title: С высокой скоростью\n")
+        f.write("#profile-title: Рабочие\n")
         f.write("#profile-update-interval: 1\n")
         f.write("#support-url: https://t.me/ine4eg\n")
         f.write("#announce: t.me/ine4eg\n")
@@ -571,14 +572,11 @@ async def do_ping_stage():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_configs_file(filepath):
+    """Читает файл, удаляет пустые строки и дубликаты"""
     configs = []
     with open(filepath, encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                cleaned = clean_url(line)
-                if cleaned and len(cleaned) > 20:
-                    configs.append(cleaned)
+            configs.append(line)
     return list(dict.fromkeys(configs))
 
 
