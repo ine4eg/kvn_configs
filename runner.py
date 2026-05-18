@@ -395,15 +395,89 @@ def extract_host_port(config):
 
 def fetch_configs(url):
     log(f"[ping] Загрузка конфигов: {url}")
-        
-    while True:
+    
+    # Список DNS-серверов для fallback
+    dns_servers = [
+        '1.1.1.1',      # Cloudflare
+        '8.8.8.8',      # Google
+        '9.9.9.9',      # Quad9
+        '208.67.222.222', # OpenDNS
+        '77.88.8.8',    # Yandex DNS
+    ]
+    
+    max_retries = 5
+    retry_delay = 3
+    
+    text = None
+    
+    for attempt in range(1, max_retries + 1):
         try:
+            # Создаём кастомный opener с поддержкой DNS over HTTPS или сменой DNS
+            # Способ 1: Пытаемся использовать разные DNS через socket.setdefaulttimeout
+            original_getaddrinfo = socket.getaddrinfo
+            
+            # Пробуем временно подменить DNS резолвер
+            for dns_server in dns_servers:
+                try:
+                    # Сохраняем оригинальный резолвер
+                    import dns.resolver
+                    
+                    # Настраиваем DNS resolver
+                    resolver = dns.resolver.Resolver()
+                    resolver.nameservers = [dns_server]
+                    resolver.timeout = 2
+                    resolver.lifetime = 3
+                    
+                    # Проверяем DNS
+                    hostname = urllib.parse.urlparse(url).hostname
+                    answers = resolver.resolve(hostname, 'A')
+                    if answers:
+                        ip = str(answers[0])
+                        log(f"[ping] Используем DNS {dns_server} -> {hostname} = {ip}")
+                        
+                        # Подменяем резолвер в socket
+                        def custom_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+                            if host == hostname:
+                                return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, port))]
+                            return original_getaddrinfo(host, port, family, type, proto, flags)
+                        
+                        socket.getaddrinfo = custom_getaddrinfo
+                        break
+                        
+                except ImportError:
+                    # Если dnspython не установлен, используем стандартный метод
+                    log(f"[ping] dnspython не установлен, используем системный DNS")
+                    break
+                except Exception as e:
+                    log(f"[ping] DNS {dns_server} не ответил: {e}")
+                    continue
+            
+            # Пытаемся загрузить конфиги
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
-                break
+                break  # Успех, выходим из цикла
+                
         except Exception as e:
-            log(f"[ping] Ошибка загрузки: {e}")
+            log(f"[ping] Попытка {attempt}/{max_retries} ошибка: {e}")
+            if attempt < max_retries:
+                log(f"[ping] Повтор через {retry_delay} сек...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, 10)  # Увеличиваем задержку
+            else:
+                log(f"[ping] Все {max_retries} попыток провалились")
+                return []
+        finally:
+            # Восстанавливаем оригинальный getaddrinfo
+            try:
+                socket.getaddrinfo = original_getaddrinfo
+            except:
+                pass
+    
+    if not text:
+        log("[ping] Не удалось загрузить конфиги")
+        return []
+    
     configs = []
     for line in text.splitlines():
         line = line.strip().replace("&amp;", "&")
@@ -419,7 +493,6 @@ def fetch_configs(url):
     
     log(f"[ping] Найдено конфигов: {len(configs)}")
     return configs
-
 
 async def measure_via_proxy(socks_port, test_url, timeout):
     connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
