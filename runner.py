@@ -27,7 +27,9 @@ import time
 import urllib.parse
 import urllib.request
 from urllib.parse import unquote
-
+import subprocess
+import urllib.parse
+    
 try:
     import aiohttp
     from aiohttp_socks import ProxyConnector
@@ -396,103 +398,100 @@ def extract_host_port(config):
 def fetch_configs(url):
     log(f"[ping] Загрузка конфигов: {url}")
     
-    # Список DNS-серверов для fallback
-    dns_servers = [
-        '1.1.1.1',      # Cloudflare
-        '8.8.8.8',      # Google
-        '9.9.9.9',      # Quad9
-        '208.67.222.222', # OpenDNS
-        '77.88.8.8',    # Yandex DNS
-    ]
+
+    # Пробуем разные DNS сервера через dig
+    def resolve_hostname(hostname, dns_server):
+        try:
+            # Пробуем dig
+            result = subprocess.run(
+                ['dig', f'@{dns_server}', hostname, '+short', '+timeout=2', '+tries=1'],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().split('\n')[0]
+        except:
+            pass
+        
+        try:
+            # Пробуем nslookup как fallback
+            result = subprocess.run(
+                ['nslookup', hostname, dns_server],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                # Парсим вывод nslookup
+                for line in result.stdout.split('\n'):
+                    if 'Address:' in line and not '#' in line:
+                        ip = line.split('Address:')[-1].strip()
+                        if ip and ip != hostname:
+                            return ip
+        except:
+            pass
+        
+        return None
     
     max_retries = 5
-    retry_delay = 3
-    
-    text = None
+    dns_servers = ['1.1.1.1', '8.8.8.8', '9.9.9.9', '208.67.222.222']
     
     for attempt in range(1, max_retries + 1):
         try:
-            # Создаём кастомный opener с поддержкой DNS over HTTPS или сменой DNS
-            # Способ 1: Пытаемся использовать разные DNS через socket.setdefaulttimeout
-            original_getaddrinfo = socket.getaddrinfo
+            # Получаем хост из URL
+            parsed = urllib.parse.urlparse(url)
+            hostname = parsed.hostname
             
-            # Пробуем временно подменить DNS резолвер
-            for dns_server in dns_servers:
-                try:
-                    # Сохраняем оригинальный резолвер
-                    import dns.resolver
-                    
-                    # Настраиваем DNS resolver
-                    resolver = dns.resolver.Resolver()
-                    resolver.nameservers = [dns_server]
-                    resolver.timeout = 2
-                    resolver.lifetime = 3
-                    
-                    # Проверяем DNS
-                    hostname = urllib.parse.urlparse(url).hostname
-                    answers = resolver.resolve(hostname, 'A')
-                    if answers:
-                        ip = str(answers[0])
-                        log(f"[ping] Используем DNS {dns_server} -> {hostname} = {ip}")
-                        
-                        # Подменяем резолвер в socket
-                        def custom_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-                            if host == hostname:
-                                return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, port))]
-                            return original_getaddrinfo(host, port, family, type, proto, flags)
-                        
-                        socket.getaddrinfo = custom_getaddrinfo
-                        break
-                        
-                except ImportError:
-                    # Если dnspython не установлен, используем стандартный метод
-                    log(f"[ping] dnspython не установлен, используем системный DNS")
+            # Пробуем зарезолвить через разные DNS
+            resolved_ip = None
+            for dns in dns_servers:
+                ip = resolve_hostname(hostname, dns)
+                if ip:
+                    resolved_ip = ip
+                    log(f"[ping] Резолвинг через {dns}: {hostname} -> {ip}")
                     break
-                except Exception as e:
-                    log(f"[ping] DNS {dns_server} не ответил: {e}")
-                    continue
             
-            # Пытаемся загрузить конфиги
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            if resolved_ip:
+                # Подменяем URL с IP вместо домена
+                ip_url = url.replace(hostname, resolved_ip, 1)
+                
+                # Добавляем заголовок Host
+                req = urllib.request.Request(
+                    ip_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Host": hostname  # Важно для GitHub
+                    }
+                )
+            else:
+                # Если не зарезолвили, пробуем как есть
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+            
             with urllib.request.urlopen(req, timeout=15) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
-                break  # Успех, выходим из цикла
-                
+            
+            # Парсим конфиги
+            configs = []
+            for line in text.splitlines():
+                line = line.strip().replace("&amp;", "&")
+                if not line or line.startswith("#"):
+                    continue
+                if re.match(r"^(vless|vmess|trojan|ss)://", line):
+                    cleaned = clean_url(line)
+                    if cleaned and len(cleaned) > 20:
+                        configs.append(cleaned)
+            
+            configs = list(dict.fromkeys(configs))
+            log(f"[ping] Найдено конфигов: {len(configs)}")
+            return configs
+            
         except Exception as e:
             log(f"[ping] Попытка {attempt}/{max_retries} ошибка: {e}")
             if attempt < max_retries:
-                log(f"[ping] Повтор через {retry_delay} сек...")
-                time.sleep(retry_delay)
-                retry_delay = min(retry_delay * 1.5, 10)  # Увеличиваем задержку
+                time.sleep(5)
             else:
-                log(f"[ping] Все {max_retries} попыток провалились")
+                log("[ping] Не удалось загрузить конфиги")
                 return []
-        finally:
-            # Восстанавливаем оригинальный getaddrinfo
-            try:
-                socket.getaddrinfo = original_getaddrinfo
-            except:
-                pass
-    
-    if not text:
-        log("[ping] Не удалось загрузить конфиги")
-        return []
-    
-    configs = []
-    for line in text.splitlines():
-        line = line.strip().replace("&amp;", "&")
-        if not line or line.startswith("#"):
-            continue
-        if re.match(r"^(vless|vmess|trojan|ss)://", line):
-            cleaned = clean_url(line)
-            if cleaned and len(cleaned) > 20:
-                configs.append(cleaned)
-    
-    # Удаляем дубликаты
-    configs = list(dict.fromkeys(configs))
-    
-    log(f"[ping] Найдено конфигов: {len(configs)}")
-    return configs
 
 async def measure_via_proxy(socks_port, test_url, timeout):
     connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
