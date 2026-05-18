@@ -27,9 +27,7 @@ import time
 import urllib.parse
 import urllib.request
 from urllib.parse import unquote
-import subprocess
-import urllib.parse
-    
+
 try:
     import aiohttp
     from aiohttp_socks import ProxyConnector
@@ -397,107 +395,31 @@ def extract_host_port(config):
 
 def fetch_configs(url):
     log(f"[ping] Загрузка конфигов: {url}")
-    
-    import socket
-    import urllib.parse
-    
-    max_retries = 5
-    retry_delay = 3
-    
-    for attempt in range(1, max_retries + 1):
+        
+    while True:
         try:
-            # ДИАГНОСТИКА: пробуем резолвить DNS отдельно
-            parsed = urllib.parse.urlparse(url)
-            hostname = parsed.hostname
-            
-            log(f"[ping] Диагностика: пробуем резолвить {hostname}...")
-            
-            try:
-                # Пробуем системный DNS
-                ip = socket.gethostbyname(hostname)
-                log(f"[ping] ✓ DNS работает: {hostname} -> {ip}")
-            except socket.gaierror as dns_err:
-                # Разбираем реальную причину DNS ошибки
-                if "Temporary failure" in str(dns_err):
-                    log(f"[ping] ✗ DNS временно недоступен. Причины:")
-                    log(f"     1. systemd-resolved не запущен")
-                    log(f"     2. /etc/resolv.conf не настроен")
-                    log(f"     3. Сетевой интерфейс не готов")
-                    log(f"     4. iptables/nftables блокирует DNS (порт 53)")
-                    
-                    # Проверяем resolv.conf
-                    try:
-                        with open('/etc/resolv.conf', 'r') as f:
-                            resolv = f.read()
-                            log(f"[ping]     /etc/resolv.conf содержит: {len(resolv)} байт")
-                            if 'nameserver' not in resolv:
-                                log(f"[ping]     ! Нет nameserver в resolv.conf")
-                    except Exception as e:
-                        log(f"[ping]     Не могу прочитать /etc/resolv.conf: {e}")
-                    
-                    # Проверяем доступность DNS серверов
-                    try:
-                        import subprocess
-                        result = subprocess.run(
-                            ['ping', '-c', '1', '-W', '1', '8.8.8.8'],
-                            capture_output=True, text=True, timeout=2
-                        )
-                        if result.returncode == 0:
-                            log(f"[ping]     Сеть работает (8.8.8.8 доступен)")
-                        else:
-                            log(f"[ping]     ! Нет доступа к 8.8.8.8 (проблема с сетью)")
-                    except:
-                        pass
-                
-                elif "No address associated" in str(dns_err):
-                    log(f"[ping] ✗ Домен {hostname} не существует или DNS запись отсутствует")
-                elif "Name or service not known" in str(dns_err):
-                    log(f"[ping] ✗ DNS сервер не знает {hostname}")
-                else:
-                    log(f"[ping] ✗ Ошибка DNS: {dns_err}")
-                
-                raise  # Перебрасываем ошибку дальше
-            
-            # Пробуем загрузить конфиги
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
-            
-            # Парсим конфиги
-            configs = []
-            for line in text.splitlines():
-                line = line.strip().replace("&amp;", "&")
-                if not line or line.startswith("#"):
-                    continue
-                if re.match(r"^(vless|vmess|trojan|ss)://", line):
-                    cleaned = clean_url(line)
-                    if cleaned and len(cleaned) > 20:
-                        configs.append(cleaned)
-            
-            configs = list(dict.fromkeys(configs))
-            log(f"[ping] Найдено конфигов: {len(configs)}")
-            return configs
-            
+                break
         except Exception as e:
-            # Выводим полную информацию об ошибке
-            import traceback
-            error_type = type(e).__name__
-            error_msg = str(e)
-            
-            log(f"[ping] Попытка {attempt}/{max_retries} ошибка: {error_type}: {error_msg}")
-            
-            # Показываем стек вызовов для диагностики
-            if attempt == max_retries:
-                log(f"[ping] Полный стек ошибки:")
-                log(traceback.format_exc())
-            
-            if attempt < max_retries:
-                log(f"[ping] Повтор через {retry_delay} сек...")
-                time.sleep(retry_delay)
-                retry_delay = min(retry_delay * 1.5, 15)
-            else:
-                log("[ping] Исчерпаны все попытки")
-                return []
+            log(f"[ping] Ошибка загрузки: {e}")
+    configs = []
+    for line in text.splitlines():
+        line = line.strip().replace("&amp;", "&")
+        if not line or line.startswith("#"):
+            continue
+        if re.match(r"^(vless|vmess|trojan|ss)://", line):
+            cleaned = clean_url(line)
+            if cleaned and len(cleaned) > 20:
+                configs.append(cleaned)
+    
+    # Удаляем дубликаты
+    configs = list(dict.fromkeys(configs))
+    
+    log(f"[ping] Найдено конфигов: {len(configs)}")
+    return configs
+
 
 async def measure_via_proxy(socks_port, test_url, timeout):
     connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
