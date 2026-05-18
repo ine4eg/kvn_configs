@@ -398,75 +398,68 @@ def extract_host_port(config):
 def fetch_configs(url):
     log(f"[ping] Загрузка конфигов: {url}")
     
-
-    # Пробуем разные DNS сервера через dig
-    def resolve_hostname(hostname, dns_server):
-        try:
-            # Пробуем dig
-            result = subprocess.run(
-                ['dig', f'@{dns_server}', hostname, '+short', '+timeout=2', '+tries=1'],
-                capture_output=True, text=True, timeout=3
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip().split('\n')[0]
-        except:
-            pass
-        
-        try:
-            # Пробуем nslookup как fallback
-            result = subprocess.run(
-                ['nslookup', hostname, dns_server],
-                capture_output=True, text=True, timeout=3
-            )
-            if result.returncode == 0:
-                # Парсим вывод nslookup
-                for line in result.stdout.split('\n'):
-                    if 'Address:' in line and not '#' in line:
-                        ip = line.split('Address:')[-1].strip()
-                        if ip and ip != hostname:
-                            return ip
-        except:
-            pass
-        
-        return None
+    import socket
+    import urllib.parse
     
     max_retries = 5
-    dns_servers = ['1.1.1.1', '8.8.8.8', '9.9.9.9', '208.67.222.222']
+    retry_delay = 3
     
     for attempt in range(1, max_retries + 1):
         try:
-            # Получаем хост из URL
+            # ДИАГНОСТИКА: пробуем резолвить DNS отдельно
             parsed = urllib.parse.urlparse(url)
             hostname = parsed.hostname
             
-            # Пробуем зарезолвить через разные DNS
-            resolved_ip = None
-            for dns in dns_servers:
-                ip = resolve_hostname(hostname, dns)
-                if ip:
-                    resolved_ip = ip
-                    log(f"[ping] Резолвинг через {dns}: {hostname} -> {ip}")
-                    break
+            log(f"[ping] Диагностика: пробуем резолвить {hostname}...")
             
-            if resolved_ip:
-                # Подменяем URL с IP вместо домена
-                ip_url = url.replace(hostname, resolved_ip, 1)
+            try:
+                # Пробуем системный DNS
+                ip = socket.gethostbyname(hostname)
+                log(f"[ping] ✓ DNS работает: {hostname} -> {ip}")
+            except socket.gaierror as dns_err:
+                # Разбираем реальную причину DNS ошибки
+                if "Temporary failure" in str(dns_err):
+                    log(f"[ping] ✗ DNS временно недоступен. Причины:")
+                    log(f"     1. systemd-resolved не запущен")
+                    log(f"     2. /etc/resolv.conf не настроен")
+                    log(f"     3. Сетевой интерфейс не готов")
+                    log(f"     4. iptables/nftables блокирует DNS (порт 53)")
+                    
+                    # Проверяем resolv.conf
+                    try:
+                        with open('/etc/resolv.conf', 'r') as f:
+                            resolv = f.read()
+                            log(f"[ping]     /etc/resolv.conf содержит: {len(resolv)} байт")
+                            if 'nameserver' not in resolv:
+                                log(f"[ping]     ! Нет nameserver в resolv.conf")
+                    except Exception as e:
+                        log(f"[ping]     Не могу прочитать /etc/resolv.conf: {e}")
+                    
+                    # Проверяем доступность DNS серверов
+                    try:
+                        import subprocess
+                        result = subprocess.run(
+                            ['ping', '-c', '1', '-W', '1', '8.8.8.8'],
+                            capture_output=True, text=True, timeout=2
+                        )
+                        if result.returncode == 0:
+                            log(f"[ping]     Сеть работает (8.8.8.8 доступен)")
+                        else:
+                            log(f"[ping]     ! Нет доступа к 8.8.8.8 (проблема с сетью)")
+                    except:
+                        pass
                 
-                # Добавляем заголовок Host
-                req = urllib.request.Request(
-                    ip_url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Host": hostname  # Важно для GitHub
-                    }
-                )
-            else:
-                # Если не зарезолвили, пробуем как есть
-                req = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0"}
-                )
+                elif "No address associated" in str(dns_err):
+                    log(f"[ping] ✗ Домен {hostname} не существует или DNS запись отсутствует")
+                elif "Name or service not known" in str(dns_err):
+                    log(f"[ping] ✗ DNS сервер не знает {hostname}")
+                else:
+                    log(f"[ping] ✗ Ошибка DNS: {dns_err}")
+                
+                raise  # Перебрасываем ошибку дальше
             
+            # Пробуем загрузить конфиги
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
             
@@ -486,11 +479,24 @@ def fetch_configs(url):
             return configs
             
         except Exception as e:
-            log(f"[ping] Попытка {attempt}/{max_retries} ошибка: {e}")
+            # Выводим полную информацию об ошибке
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e)
+            
+            log(f"[ping] Попытка {attempt}/{max_retries} ошибка: {error_type}: {error_msg}")
+            
+            # Показываем стек вызовов для диагностики
+            if attempt == max_retries:
+                log(f"[ping] Полный стек ошибки:")
+                log(traceback.format_exc())
+            
             if attempt < max_retries:
-                time.sleep(5)
+                log(f"[ping] Повтор через {retry_delay} сек...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, 15)
             else:
-                log("[ping] Не удалось загрузить конфиги")
+                log("[ping] Исчерпаны все попытки")
                 return []
 
 async def measure_via_proxy(socks_port, test_url, timeout):
