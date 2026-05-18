@@ -14,9 +14,9 @@ services:
       RUN_INTERVAL: "3600"
       OUTPUT_DIR: "/data"
       API_PORT: "29000"
-    dns:
+    # dns:
       # - 77.88.8.8
-      - 8.8.8.8
+      # - 8.8.8.8
     # sysctls:
     #   - net.ipv6.conf.all.disable_ipv6=1
     #   - net.ipv6.conf.default.disable_ipv6=1
@@ -38,6 +38,4 @@ services:
   #     - vpn-network
     # Не нужно пробрасывать порты, localtunnel сам создает публичный URL
 
-networks:
-  vpn-network:
-    driver: bridge
+network_mode: "host"
