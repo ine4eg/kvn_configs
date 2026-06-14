@@ -332,19 +332,31 @@ async def start_xray(config, socks_port):
         json.dump(config, tmp)
         tmp.close()
 
+        # Временно: пишем stderr в файл для диагностики
+        log_path = tmp.name.replace(".json", ".log")
+        log_file = open(log_path, "w")
+
         kwargs = {}
         if os.name != "nt":
             kwargs["preexec_fn"] = os.setsid
 
         proc = subprocess.Popen(
             [XRAY_BIN, "run", "-c", tmp.name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
             **kwargs
         )
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.5)
+
+        # Читаем лог и выводим
+        log_file.flush()
+        with open(log_path, "r") as f:
+            output = f.read().strip()
+        if output:
+            log(f"[xray:{socks_port}] {output[:500]}")
 
         if proc.poll() is not None:
+            log(f"[xray:{socks_port}] ❌ Процесс завершился (exit={proc.poll()})")
             os.unlink(tmp.name)
             return None
 
@@ -843,7 +855,7 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
         "log": {"loglevel": "warning"},
         "inbounds": [{
             "port": bridge_inbound_port,
-            "listen": "",
+            "listen": "0.0.0.0",
             "protocol": "shadowsocks",
             "settings": {
                 "method": SS_METHOD,
