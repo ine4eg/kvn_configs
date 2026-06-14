@@ -72,6 +72,15 @@ UPLOAD_URL      = "https://speed.cloudflare.com/__up"
 IP_API          = "http://ip-api.com/json/"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  BRIDGE — self-hosted VLESS → лучший конфиг
+# ═══════════════════════════════════════════════════════════════════════════════
+import uuid
+BRIDGE_IP        = "95.165.137.180"
+BRIDGE_PORT      = 8443
+BRIDGE_UUID      = str(uuid.uuid5(uuid.NAMESPACE_DNS, "self-hosted-ru-bridge"))
+BRIDGE_SOCKS_PORT = 15000   # локальный SOCKS лучшего конфига
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ОБЩИЕ УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -765,6 +774,185 @@ class SpeedTester:
         return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BRIDGE — self-hosted VLESS → лучший конфиг
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Храним PIDs bridge-процессов для перезапуска при новом цикле
+_bridge_procs = []
+
+def _extract_download_mbps(uri):
+    """Извлечь download Mbps из лейбла URI (после #)"""
+    try:
+        label = uri.split("#", 1)[1]
+        # Ищем паттерн вроде "123mbps" или "123/45mbps"
+        m = re.search(r"(\d+)mbps", label, re.IGNORECASE)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+def find_best_config():
+    """Найти конфиг с максимальной download-скоростью из tested_configs.txt"""
+    if not os.path.exists(TESTED_FILE):
+        return None
+    configs = parse_configs_file(TESTED_FILE)
+    if not configs:
+        return None
+    return max(configs, key=_extract_download_mbps)
+
+def _build_best_outbound_uri(best_uri, socks_port):
+    """
+    Берём URI лучшего конфига и возвращаем его «нативный» outbound-конфиг
+    (host + port) для SOCKS-переадресации.
+    """
+    # Парсим хост:порт из best_uri
+    m = re.match(r"(?:vless|vmess|trojan|ss)://[^@]+@([^:]+):(\d+)", best_uri)
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
+
+def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
+    """
+    Создаём xray-конфиг:
+      inbound  → VLESS на 0.0.0.0:bridge_inbound_port (без TLS)
+      outbound → SOCKS через upstream_socks_port (лучший конфиг)
+    """
+    host, port = _build_best_outbound_uri(best_uri, upstream_socks_port)
+    if not host:
+        return None
+
+    return {
+        "log": {"loglevel": "none"},
+        "inbounds": [{
+            "port": bridge_inbound_port,
+            "listen": "0.0.0.0",
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": BRIDGE_UUID, "flow": "", "level": 0}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "none",
+                "tcpSettings": {}
+            }
+        }],
+        "outbounds": [{
+            "protocol": "socks",
+            "settings": {
+                "servers": [{
+                    "address": "127.0.0.1",
+                    "port": upstream_socks_port
+                }]
+            }
+        }],
+        "routing": {
+            "rules": [{
+                "type": "field",
+                "inboundTag": ["*"],
+                "outboundTag": "0"
+            }]
+        }
+    }
+
+def _build_upstream_xray(best_uri, socks_port):
+    """Создаём xray-конфиг лучшего конфига с SOCKS на socks_port."""
+    return make_xray_config(best_uri, socks_port)
+
+
+async def create_bridge():
+    """
+    Создаёт mост:
+      1. Находим лучший конфиг по download-скорости
+      2. Запускаем его xray на SOCKS порту (BRIDGE_SOCKS_PORT)
+      3. Запускаем bridge xray (VLESS без TLS → SOCKS лучшего)
+      4. Добавляем bridge URI в начало tested_configs.txt
+    """
+    log("=" * 60)
+    log("  BRIDGE: Создание self-hosted VLESS моста")
+    log("=" * 60)
+
+    best_uri = find_best_config()
+    if not best_uri:
+        log("[bridge] Нет быстрых конфигов, пропускаем")
+        return
+
+    dl = _extract_download_mbps(best_uri)
+    log(f"[bridge] Лучший конфиг: ↓{dl} Mbps — {get_label(best_uri)[:50]}")
+
+    # ── Остановить старые bridge-процессы ─────────────────────────────
+    for proc in _bridge_procs:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _bridge_procs.clear()
+
+    # ── Запустить лучший конфиг как SOCKS ─────────────────────────────
+    upstream_cfg = _build_upstream_xray(best_uri, BRIDGE_SOCKS_PORT)
+    if not upstream_cfg:
+        log("[bridge] Не удалось создать конфиг лучшего, пропускаем")
+        return
+
+    upstream_proc = await start_xray(upstream_cfg, BRIDGE_SOCKS_PORT)
+    if not upstream_proc:
+        log("[bridge] Не удалось запустить xray лучшего конфига")
+        return
+    _bridge_procs.append(upstream_proc)
+    log(f"[bridge] Upstream xray запущен (SOCKS :{BRIDGE_SOCKS_PORT})")
+
+    # ── Запустить bridge VLESS ────────────────────────────────────────
+    bridge_cfg = _build_bridge_xray(best_uri, BRIDGE_PORT, BRIDGE_SOCKS_PORT)
+    if not bridge_cfg:
+        log("[bridge] Не удалось создать bridge-конфиг")
+        return
+
+    bridge_proc = await start_xray(bridge_cfg, BRIDGE_PORT)
+    if not bridge_proc:
+        log("[bridge] Не удалось запустить bridge xray")
+        return
+    _bridge_procs.append(bridge_proc)
+    log(f"[bridge] Bridge xray запущен (VLESS :{BRIDGE_PORT} без TLS)")
+
+    # ── Сгенерировать bridge URI ──────────────────────────────────────
+    bridge_label = "self-hosted RU 🇷🇺"
+    bridge_uri = f"vless://{BRIDGE_UUID}@{BRIDGE_IP}:{BRIDGE_PORT}?type=tcp#{urllib.parse.quote(bridge_label)}"
+    log(f"[bridge] URI: {bridge_uri}")
+
+    # ── Добавить в начало tested_configs.txt ──────────────────────────
+    existing_lines = []
+    header_lines = []
+    if os.path.exists(TESTED_FILE):
+        with open(TESTED_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    header_lines.append(line)
+                elif line:
+                    existing_lines.append(line)
+
+    # Удаляем старый bridge URI из списка (если был)
+    existing_lines = [
+        l for l in existing_lines
+        if not l.startswith(f"vless://{BRIDGE_UUID}@")
+    ]
+
+    # Собираем обратно: header + bridge + остальное
+    with open(TESTED_FILE, "w", encoding="utf-8") as f:
+        for hl in header_lines:
+            f.write(hl + "\n")
+        f.write("\n")
+        f.write(bridge_uri + "\n")
+        for l in existing_lines:
+            f.write(l + "\n")
+
+    log(f"[bridge] ✅ Bridge-конфиг добавлен в начало {TESTED_FILE}")
+
+
 async def do_speed_stage():
     log("=" * 60)
     log("  ЭТАП 2: SPEED-ТЕСТ")
@@ -798,6 +986,9 @@ async def do_speed_stage():
                 f.write(r + "\n")
         log(f"[speed] Готово! Найдено {len(results)} быстрых конфигов — {TESTED_FILE}")
         log(f"[speed] Время: {elapsed:.1f} сек, скорость: {len(configs)/elapsed:.1f} конфигов/сек")
+
+        # ── Создаём bridge после speed-теста ─────────────────────────
+        await create_bridge()
     else:
         log("[speed] Не найдено ни одного быстрого конфига")
 
