@@ -874,22 +874,20 @@ def _build_upstream_xray(best_uri, socks_port):
     return make_xray_config(best_uri, socks_port)
 
 
-async def create_bridge():
+async def create_bridge(best_uri):
     """
-    Создаёт mост:
-      1. Находим лучший конфиг по download-скорости
-      2. Запускаем его xray на SOCKS порту (BRIDGE_SOCKS_PORT)
-      3. Запускаем bridge xray (VLESS без TLS → SOCKS лучшего)
-      4. Добавляем bridge URI в начало tested_configs.txt
+    Создаёт мост:
+      1. Запускаем лучший конфиг (best_uri) на SOCKS порту (BRIDGE_SOCKS_PORT)
+      2. Запускаем bridge xray (VLESS без TLS → SOCKS лучшего)
+      3. Добавляем bridge URI в начало tested_configs.txt
     """
+    if not best_uri:
+        log("[bridge] best_uri не передан, пропускаем")
+        return
+
     log("=" * 60)
     log("  BRIDGE: Создание self-hosted VLESS моста")
     log("=" * 60)
-
-    best_uri = find_best_config()
-    if not best_uri:
-        log("[bridge] Нет быстрых конфигов, пропускаем")
-        return
 
     dl = _extract_download_mbps(best_uri)
     log(f"[bridge] Лучший конфиг: ↓{dl} Mbps — {get_label(best_uri)[:50]}")
@@ -1001,8 +999,9 @@ async def do_speed_stage():
         log(f"[speed] Готово! Найдено {len(results)} быстрых конфигов — {TESTED_FILE}")
         log(f"[speed] Время: {elapsed:.1f} сек, скорость: {len(configs)/elapsed:.1f} конфигов/сек")
 
-        # ── Создаём bridge после speed-теста ─────────────────────────
-        await create_bridge()
+        # ── Найти лучший конфиг и создать bridge ────────────────────
+        best = max(results, key=_extract_download_mbps)
+        await create_bridge(best)
     else:
         log("[speed] Не найдено ни одного быстрого конфига")
 
