@@ -57,7 +57,7 @@ PING_TRIES      = 2
 PING_SOCKS_BASE = 10800
 
 # Speed-тест
-SPEED_TIMEOUT   = 300          # таймаут на один конфиг (сек) — для 20 МБ по медленному VPN
+SPEED_TIMEOUT   = 60          # таймаут на один конфиг (сек) — для 20 МБ по медленному VPN
 SPEED_MIN_MBPS  = 5
 SPEED_MAX_WORKERS = 60
 SPEED_SOCKS_BASE = 12000
