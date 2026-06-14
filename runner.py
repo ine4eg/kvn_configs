@@ -57,14 +57,17 @@ PING_TRIES      = 2
 PING_SOCKS_BASE = 10800
 
 # Speed-тест
-SPEED_TIMEOUT   = 150
+SPEED_TIMEOUT   = 300          # таймаут на один конфиг (сек) — для 20 МБ по медленному VPN
 SPEED_MIN_MBPS  = 5
 SPEED_MAX_WORKERS = 60
 SPEED_SOCKS_BASE = 12000
+# 20 МБ = 20 * 1024 * 1024 = 20971520 байт
+DOWNLOAD_BYTES  = 20 * 1024 * 1024   # 20 MB
 DOWNLOAD_URLS   = [
-    "http://speed.cloudflare.com/__down?bytes=3000000",
-    "https://cachefly.cachefly.net/1mb.test",
+    f"http://speed.cloudflare.com/__down?bytes={DOWNLOAD_BYTES}",
+    f"https://speed.cloudflare.com/__down?bytes={DOWNLOAD_BYTES}",
 ]
+UPLOAD_BYTES    = 20 * 1024 * 1024   # 20 MB
 UPLOAD_URL      = "https://speed.cloudflare.com/__up"
 IP_API          = "http://ip-api.com/json/"
 
@@ -369,8 +372,6 @@ def stop_xray(proc):
 #  ШАГ 1 — PING-ТЕСТ (vpn_ping_test)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-
-
 def extract_host_port(config):
     try:
         if '://' in config:
@@ -395,29 +396,38 @@ def extract_host_port(config):
 
 def fetch_configs(url):
     log(f"[ping] Загрузка конфигов: {url}")
-        
-    while True:
+    text = None
+    while text is None:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
-                break
+            break
         except Exception as e:
-            log(f"[ping] Ошибка загрузки: {e}")
+            log(f"[ping] Ошибка загрузки: {e}, повтор через 5 сек...")
+            time.sleep(5)
+
     configs = []
+    seen_hosts = set()
     for line in text.splitlines():
-        line = line.strip().replace("&amp;", "&")
+        line = line.strip().replace("&#38;amp;", "&#38;")
+        line = line.strip().replace("&" + "amp;", "&")
         if not line or line.startswith("#"):
             continue
         if re.match(r"^(vless|vmess|trojan|ss)://", line):
             cleaned = clean_url(line)
             if cleaned and len(cleaned) > 20:
-                configs.append(cleaned)
-    
-    # Удаляем дубликаты
+                host_port = extract_host_port(cleaned)
+                if host_port and host_port not in seen_hosts:
+                    seen_hosts.add(host_port)
+                    configs.append(cleaned)
+                elif not host_port:
+                    configs.append(cleaned)
+
+    # Удаляем дубликаты сохраняя порядок
     configs = list(dict.fromkeys(configs))
-    
-    log(f"[ping] Найдено конфигов: {len(configs)}")
+
+    log(f"[ping] Найдено конфигов: {len(configs)} (уникальных хостов: {len(seen_hosts)})")
     return configs
 
 
@@ -486,30 +496,35 @@ async def run_ping_test(configs):
     await asyncio.gather(*[bounded(uri, i) for i, uri in enumerate(configs)])
     return results
 
+
 def get_country_by_ip(host, db_path='/usr/share/GeoIP/GeoLite2-Country.mmdb'):
     """Получить флаг страны по IP/домену из локальной базы GeoIP"""
-    import geoip2.database
-    import socket
+    try:
+        import geoip2.database
+        import socket
+    except ImportError:
+        return "🌍"
     
     try:
-        # Извлекаем IP из URI
-        if '://' in host:
-            host = host.split('://')[1]
-        if '@' in host:
-            host = host.split('@')[1]
-        host = host.split(':')[0].split('?')[0]
+        # Извлекаем хост из URI
+        h = host
+        if '://' in h:
+            h = h.split('://')[1]
+        if '@' in h:
+            h = h.split('@')[1]
+        h = h.split(':')[0].split('?')[0]
         
         # Разрешаем домен в IP
-        ip = socket.gethostbyname(host)
+        ip = socket.gethostbyname(h)
         
         # Определяем страну по базе
         with geoip2.database.Reader(db_path) as reader:
             response = reader.country(ip)
-            # log (response)
             return get_flag(response.country.iso_code)
     except Exception:
         pass
     return "🌍"
+
 
 def save_working_configs(results):
     ok = sorted([r for r in results if r["ping"] is not None], key=lambda x: x["ping"])
@@ -542,6 +557,7 @@ def save_working_configs(results):
     log(f"[ping] Сохранено {len(ok)} рабочих конфигов -> {WORKING_FILE}")
     return len(ok)
 
+
 async def do_ping_stage():
     log("=" * 60)
     log("  ЭТАП 1: PING-ТЕСТ")
@@ -572,11 +588,19 @@ async def do_ping_stage():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_configs_file(filepath):
-    """Читает файл, удаляет пустые строки и дубликаты"""
+    """Читает файл, пропускает заголовки (#profile-*), удаляет пустые строки и дубликаты"""
     configs = []
     with open(filepath, encoding="utf-8") as f:
         for line in f:
-            configs.append(line)
+            line = line.strip()
+            if not line:
+                continue
+            # Пропускаем комментарии кроме subscription-userinfo (Clash-заголовки)
+            if line.startswith("#"):
+                continue
+            cleaned = clean_url(line)
+            if cleaned and len(cleaned) > 20:
+                configs.append(cleaned)
     return list(dict.fromkeys(configs))
 
 
@@ -632,6 +656,7 @@ async def speed_test_one(uri, idx):
     try:
         result = await asyncio.wait_for(_measure_speed(uri, socks_port), timeout=SPEED_TIMEOUT)
     except asyncio.TimeoutError:
+        log(f"[speed] TIMEOUT ({SPEED_TIMEOUT}s) конфиг #{idx}")
         result = None
 
     proc.terminate()
@@ -648,19 +673,31 @@ async def speed_test_one(uri, idx):
 
 
 async def _measure_speed(uri, port):
+    """
+    Измеряет download и upload скорость через SOCKS-прокси.
+    Использует 20 МБ для каждого направления с пер-конфиг таймаут-лимитом,
+    чтобы очень медленные конфиги не вешали тест бесконечно.
+    """
+    # Оставляем ~10 сек на handshake + IP-запрос, остальное — на dl + up
+    _per_request_timeout = max(SPEED_TIMEOUT - 10, 60)
+
     try:
         connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
         async with aiohttp.ClientSession(connector=connector) as session:
             down_mbps = 0
             up_mbps   = 0
 
+            # ── DOWNLOAD ──────────────────────────────────────────────
             for url in DOWNLOAD_URLS:
                 try:
                     start = time.time()
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=SPEED_TIMEOUT)) as resp:
+                    async with session.get(url,
+                                           timeout=aiohttp.ClientTimeout(total=_per_request_timeout),
+                                           ssl=False) as resp:
                         data = await resp.read()
                     elapsed = time.time() - start
-                    down_mbps = (len(data) * 8) / elapsed / 1e6
+                    if elapsed > 0:
+                        down_mbps = (len(data) * 8) / elapsed / 1e6
                     if down_mbps > 0:
                         break
                 except Exception:
@@ -669,14 +706,16 @@ async def _measure_speed(uri, port):
             if down_mbps == 0:
                 return None
 
+            # ── UPLOAD ────────────────────────────────────────────────
             try:
-                payload = b'x' * 500000
+                payload = b'\x00' * UPLOAD_BYTES
                 start = time.time()
                 async with session.post(UPLOAD_URL, data=payload,
-                                        timeout=aiohttp.ClientTimeout(total=SPEED_TIMEOUT)) as resp:
+                                        timeout=aiohttp.ClientTimeout(total=_per_request_timeout)) as resp:
                     await resp.read()
                 elapsed = time.time() - start
-                up_mbps = (len(payload) * 8) / elapsed / 1e6
+                if elapsed > 0:
+                    up_mbps = (len(payload) * 8) / elapsed / 1e6
             except Exception:
                 pass
 
@@ -688,10 +727,11 @@ async def _measure_speed(uri, port):
             except Exception:
                 pass
 
-            if down_mbps >= SPEED_MIN_MBPS and up_mbps >= SPEED_MIN_MBPS:
+            if down_mbps >= SPEED_MIN_MBPS:
                 proto = protocol_name(uri)
                 flag  = get_flag(country) if country else "🏳"
-                label = f"{proto} {flag} {down_mbps:.0f}/{up_mbps:.0f}mbps t.me/ine4eg"
+                up_str = f"/{up_mbps:.0f}" if up_mbps > 0 else ""
+                label = f"{proto} {flag} {down_mbps:.0f}{up_str}mbps t.me/ine4eg"
                 new_uri = rebuild_uri(uri, label)
                 log(f"[speed] OK ↓{down_mbps:.1f}/↑{up_mbps:.1f} Mbps  {proto} {flag}")
                 return new_uri
