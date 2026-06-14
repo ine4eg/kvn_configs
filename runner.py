@@ -840,15 +840,16 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
         return None
 
     return {
-        "log": {"loglevel": "none"},
+        "log": {"loglevel": "warning"},
         "inbounds": [{
             "port": bridge_inbound_port,
-            # "listen": "95.165.137.180",
+            "listen": "",
             "protocol": "shadowsocks",
             "settings": {
                 "method": SS_METHOD,
                 "password": SS_PASSWORD,
-                "udp": False
+                "udp": True,
+                "network": "tcp,udp"
             }
         }],
         "outbounds": [{
@@ -860,12 +861,26 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
                 }]
             }
         }],
+        "dns": {
+            "servers": [
+                "1.1.1.1",
+                "8.8.8.8"
+            ],
+            "queryStrategy": "UseIPv4"
+        },
         "routing": {
-            "rules": [{
-                "type": "field",
-                "inboundTag": ["*"],
-                "outboundTag": "0"
-            }]
+            "rules": [
+                {
+                    "type": "field",
+                    "domain": ["geosite:cn", "geosite:private"],
+                    "outboundTag": "direct"
+                },
+                {
+                    "type": "field",
+                    "inboundTag": ["*"],
+                    "outboundTag": "0"
+                }
+            ]
         }
     }
 
