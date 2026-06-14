@@ -843,7 +843,7 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
         "log": {"loglevel": "none"},
         "inbounds": [{
             "port": bridge_inbound_port,
-            "listen": "0.0.0.0",
+            "listen": "95.165.137.180",
             "protocol": "shadowsocks",
             "settings": {
                 "method": SS_METHOD,
