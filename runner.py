@@ -57,9 +57,9 @@ PING_TRIES      = 2
 PING_SOCKS_BASE = 10800
 
 # Speed-тест
-SPEED_TIMEOUT   = 60          # таймаут на один конфиг (сек) — для 20 МБ по медленному VPN
+SPEED_TIMEOUT   = 30          # таймаут на один конфиг (сек) — для 20 МБ по медленному VPN
 SPEED_MIN_MBPS  = 5
-SPEED_MAX_WORKERS = 60
+SPEED_MAX_WORKERS = 70
 SPEED_SOCKS_BASE = 12000
 # 20 МБ = 20 * 1024 * 1024 = 20971520 байт
 DOWNLOAD_BYTES  = 20 * 1024 * 1024   # 20 MB
@@ -864,36 +864,19 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
                 "network": "tcp,udp"
             }
         }],
-        "outbounds": [{
-            "protocol": "socks",
-            "settings": {
-                "servers": [{
-                    "address": "127.0.0.1",
-                    "port": upstream_socks_port
-                }]
-            }
-        }],
-        "dns": {
-            "servers": [
-                "1.1.1.1",
-                "8.8.8.8"
-            ],
-            "queryStrategy": "UseIPv4"
-        },
-        "routing": {
-            "rules": [
-                {
-                    "type": "field",
-                    "domain": ["geosite:cn", "geosite:private"],
-                    "outboundTag": "direct"
-                },
-                {
-                    "type": "field",
-                    "inboundTag": ["*"],
-                    "outboundTag": "0"
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "socks",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": upstream_socks_port
+                    }]
                 }
-            ]
-        }
+            }
+        ]
+        # routing убран — весь трафик идёт в proxy (upstream socks)
     }
 
 def _build_upstream_xray(best_uri, socks_port):
