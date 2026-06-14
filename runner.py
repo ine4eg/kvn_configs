@@ -785,7 +785,13 @@ def _extract_download_mbps(uri):
     """Извлечь download Mbps из лейбла URI (после #)"""
     try:
         label = uri.split("#", 1)[1]
+        # URL-decode лейбла (пробелы могут быть %20)
+        label = urllib.parse.unquote(label)
         # Ищем паттерн вроде "123mbps" или "123/45mbps"
+        m = re.search(r"(\d+)\s*/\s*(?:\d+\s*)?mbps", label, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        # Попробуем просто число перед mbps
         m = re.search(r"(\d+)mbps", label, re.IGNORECASE)
         return int(m.group(1)) if m else 0
     except Exception:
@@ -798,7 +804,15 @@ def find_best_config():
     configs = parse_configs_file(TESTED_FILE)
     if not configs:
         return None
-    return max(configs, key=_extract_download_mbps)
+    # Исключаем bridge URI и конфиги со скоростью 0
+    real_configs = [
+        c for c in configs
+        if not c.startswith(f"vless://{BRIDGE_UUID}@")
+        and _extract_download_mbps(c) > 0
+    ]
+    if not real_configs:
+        return None
+    return max(real_configs, key=_extract_download_mbps)
 
 def _build_best_outbound_uri(best_uri, socks_port):
     """
