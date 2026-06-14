@@ -775,8 +775,12 @@ class SpeedTester:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BRIDGE — self-hosted VLESS → лучший конфиг
+#  BRIDGE — self-hosted Shadowsocks → лучший конфиг
 # ═══════════════════════════════════════════════════════════════════════════════
+import hashlib
+
+SS_METHOD    = "chacha20-ietf-poly1305"
+SS_PASSWORD  = hashlib.md5(b"self-hosted-ru-bridge").hexdigest()  # deterministic 32-char
 
 # Храним PIDs bridge-процессов для перезапуска при новом цикле
 _bridge_procs = []
@@ -807,7 +811,7 @@ def find_best_config():
     # Исключаем bridge URI и конфиги со скоростью 0
     real_configs = [
         c for c in configs
-        if not c.startswith(f"vless://{BRIDGE_UUID}@")
+        if not c.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
         and _extract_download_mbps(c) > 0
     ]
     if not real_configs:
@@ -828,7 +832,7 @@ def _build_best_outbound_uri(best_uri, socks_port):
 def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
     """
     Создаём xray-конфиг:
-      inbound  → VLESS на 0.0.0.0:bridge_inbound_port (без TLS)
+      inbound  → Shadowsocks на 0.0.0.0:bridge_inbound_port
       outbound → SOCKS через upstream_socks_port (лучший конфиг)
     """
     host, port = _build_best_outbound_uri(best_uri, upstream_socks_port)
@@ -840,15 +844,11 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
         "inbounds": [{
             "port": bridge_inbound_port,
             "listen": "0.0.0.0",
-            "protocol": "vless",
+            "protocol": "shadowsocks",
             "settings": {
-                "clients": [{"id": BRIDGE_UUID, "flow": "", "level": 0}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "none",
-                "tcpSettings": {}
+                "method": SS_METHOD,
+                "password": SS_PASSWORD,
+                "udp": False
             }
         }],
         "outbounds": [{
@@ -886,7 +886,7 @@ async def create_bridge(best_uri):
         return
 
     log("=" * 60)
-    log("  BRIDGE: Создание self-hosted VLESS моста")
+    log("  BRIDGE: Создание self-hosted Shadowsocks моста")
     log("=" * 60)
 
     dl = _extract_download_mbps(best_uri)
@@ -917,7 +917,7 @@ async def create_bridge(best_uri):
     _bridge_procs.append(upstream_proc)
     log(f"[bridge] Upstream xray запущен (SOCKS :{BRIDGE_SOCKS_PORT})")
 
-    # ── Запустить bridge VLESS ────────────────────────────────────────
+    # ── Запустить bridge Shadowsocks ───────────────────────────────────
     bridge_cfg = _build_bridge_xray(best_uri, BRIDGE_PORT, BRIDGE_SOCKS_PORT)
     if not bridge_cfg:
         log("[bridge] Не удалось создать bridge-конфиг")
@@ -928,11 +928,12 @@ async def create_bridge(best_uri):
         log("[bridge] Не удалось запустить bridge xray")
         return
     _bridge_procs.append(bridge_proc)
-    log(f"[bridge] Bridge xray запущен (VLESS :{BRIDGE_PORT} без TLS)")
+    log(f"[bridge] Bridge xray запущен (Shadowsocks :{BRIDGE_PORT})")
 
     # ── Сгенерировать bridge URI ──────────────────────────────────────
     bridge_label = "self-hosted RU 🇷🇺"
-    bridge_uri = f"vless://{BRIDGE_UUID}@{BRIDGE_IP}:{BRIDGE_PORT}?type=tcp#{urllib.parse.quote(bridge_label)}"
+    userinfo = base64.b64encode(f"{SS_METHOD}:{SS_PASSWORD}".encode()).decode()
+    bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_PORT}#{urllib.parse.quote(bridge_label)}"
     log(f"[bridge] URI: {bridge_uri}")
 
     # ── Добавить в начало tested_configs.txt ──────────────────────────
@@ -950,7 +951,7 @@ async def create_bridge(best_uri):
     # Удаляем старый bridge URI из списка (если был)
     existing_lines = [
         l for l in existing_lines
-        if not l.startswith(f"vless://{BRIDGE_UUID}@")
+        if not l.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
     ]
 
     # Собираем обратно: header + bridge + остальное
