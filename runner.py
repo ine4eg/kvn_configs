@@ -6,15 +6,8 @@ VPN Config Runner
   1. vpn_ping_test  — скачивает конфиги, пингует, сохраняет рабочие в working_configs.txt
   2. speed_test     — берёт working_configs.txt, мерит скорость, сохраняет в tested_configs.txt
 
-BRIDGE ARCHITECTURE:
-  • 3 upstream xray (SOCKS) работают параллельно на портах 10801-10803
-  • 1 bridge xray (SS) на порту 8443 слушает весь трафик клиентов
-  • bridge маршрутизирует на лучший healthy upstream
-  • health-check каждые 10 секунд пингует каждый upstream
-  • failover = перезапуск bridge с routing на другой healthy upstream
-
 Переменные окружения:
-  CONFIG_URL     — URL списка конфигов
+  CONFIG_URL     — URL списка конфигов (по умолчанию захардкожен ниже)
   XRAY_BIN       — путь к xray-бинарнику (default: xray)
   RUN_INTERVAL   — интервал в секундах (default: 3600)
   OUTPUT_DIR     — папка для файлов (default: /data)
@@ -22,7 +15,6 @@ BRIDGE ARCHITECTURE:
 
 import asyncio
 import base64
-import hashlib
 import json
 import os
 import re
@@ -65,384 +57,28 @@ PING_TRIES      = 2
 PING_SOCKS_BASE = 10800
 
 # Speed-тест
-SPEED_TIMEOUT   = 60
+SPEED_TIMEOUT   = 30          # таймаут на один конфиг (сек) — для 20 МБ по медленному VPN
 SPEED_MIN_MBPS  = 5
 SPEED_MAX_WORKERS = 70
 SPEED_SOCKS_BASE = 12000
-DOWNLOAD_BYTES  = 20 * 1024 * 1024
+# 20 МБ = 20 * 1024 * 1024 = 20971520 байт
+DOWNLOAD_BYTES  = 20 * 1024 * 1024   # 20 MB
 DOWNLOAD_URLS   = [
     f"http://speed.cloudflare.com/__down?bytes={DOWNLOAD_BYTES}",
     f"https://speed.cloudflare.com/__down?bytes={DOWNLOAD_BYTES}",
 ]
-UPLOAD_BYTES    = 20 * 1024 * 1024
+UPLOAD_BYTES    = 20 * 1024 * 1024   # 20 MB
 UPLOAD_URL      = "https://speed.cloudflare.com/__up"
 IP_API          = "http://ip-api.com/json/"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BRIDGE — 3 upstream + 1 bridge (порт 8443) + health-check каждые 10с
+#  BRIDGE — self-hosted VLESS → лучший конфиг
 # ═══════════════════════════════════════════════════════════════════════════════
-
-BRIDGE_IP       = "95.165.137.180"
-BRIDGE_PORT     = 8443               # ОДИН порт для клиентов (SS)
-HEALTH_INTERVAL = 10                 # секунд между health-checkами
-UPSTREAM_SOCKS_BASE = 19001          # SOCKS для upstream: 19001, 19002, 19003
-FAILOVER_MAX_RETRIES = 5
-
-# Shadowsocks credentials
-SS_METHOD    = "chacha20-ietf-poly1305"
-SS_PASSWORD  = hashlib.md5(b"self-hosted-ru-bridge").hexdigest()
-
-_bridge_manager = None
-
-
-class _BridgeSlot:
-    """Слот для одного upstream-конфига"""
-    def __init__(self):
-        self.uri = None
-        self.label = ""
-        self.download_mbps = 0
-        self.upload_mbps = 0
-        self.healthy = False
-        self.consecutive_failures = 0
-        self.last_check = None
-        self.upstream_proc = None
-        self.upstream_socks_port = 0
-
-
-class BridgeManager:
-    """
-    Архитектура:
-      • 3 upstream xray (SOCKS) на внутренних портах 19001-19003
-      • 1 bridge xray (SS) на BRIDGE_PORT=8443, маршрутизирует на активный upstream
-      • health-check каждые 10с пингует каждый upstream
-      • failover = перезапуск bridge с routing на healthy upstream
-    """
-
-    def __init__(self):
-        self.slots = [_BridgeSlot() for _ in range(3)]
-        self.backup_pool = []
-        self.backup_cursor = 0
-        self._health_task = None
-        self._bridge_proc = None
-        self._active_upstream_idx = 0
-        self._lock = asyncio.Lock()
-
-    # ── Публичный API ───────────────────────────────────────────────
-
-    async def start_top3(self, tested_results):
-        """Запустить 3 upstream + 1 bridge на BRIDGE_PORT"""
-        await self._stop_all()
-
-        real = [
-            c for c in tested_results
-            if not _is_bridge_uri(c) and _extract_download_mbps(c) > 0
-        ]
-        real.sort(key=_extract_download_mbps, reverse=True)
-
-        if not real:
-            log("[bridge] Нет рабочих конфигов")
-            return
-
-        top3 = real[:3]
-        self.backup_pool = real[3:]
-        self.backup_cursor = 0
-
-        for i, uri in enumerate(top3):
-            slot = self.slots[i]
-            slot.uri = uri
-            slot.label = get_label(uri)
-            slot.download_mbps = _extract_download_mbps(uri)
-            slot.upstream_socks_port = UPSTREAM_SOCKS_BASE + i
-            slot.healthy = False
-            slot.consecutive_failures = 0
-
-        log("[bridge] Запуск 3 upstream процессов...")
-        await asyncio.gather(*[self._start_upstream(i) for i in range(3)])
-
-        self._active_upstream_idx = 0
-        await self._restart_bridge()
-        self._save_bridge_uri()
-
-        self._health_task = asyncio.create_task(self._health_loop())
-        log(f"[bridge] ✅ Bridge запущен SS:{BRIDGE_PORT}")
-        log(f"[bridge] Active slot[{self._active_upstream_idx}] = {self.slots[self._active_upstream_idx].label[:50]}")
-
-    # ── Health-check ────────────────────────────────────────────────
-
-    async def _health_loop(self):
-        while True:
-            try:
-                await self._do_health_check()
-            except Exception as e:
-                log(f"[bridge-health] Ошибка: {e}")
-            await asyncio.sleep(HEALTH_INTERVAL)
-
-    async def _do_health_check(self):
-        now = time.time()
-        for i, slot in enumerate(self.slots):
-            if slot.upstream_proc is None or slot.upstream_proc.poll() is not None:
-                slot.healthy = False
-                slot.consecutive_failures += 1
-                continue
-
-            ms = await _ping_upstream(slot.upstream_socks_port)
-            slot.last_check = now
-
-            if ms is not None and ms < 5000:
-                if not slot.healthy:
-                    log(f"[bridge-health] ✅ slot[{i}] recovered  {slot.label[:40]}")
-                slot.healthy = True
-                slot.consecutive_failures = 0
-            else:
-                if slot.healthy:
-                    log(f"[bridge-health] ❌ slot[{i}] down  {slot.label[:40]}")
-                slot.healthy = False
-                slot.consecutive_failures += 1
-
-        if not self.slots[self._active_upstream_idx].healthy:
-            log(f"[bridge-health] ⚠️  Active slot[{self._active_upstream_idx}] unhealthy → failover")
-            await self._failover()
-
-    # ── Failover ────────────────────────────────────────────────────
-
-    async def _failover(self):
-        """Переключить bridge на другой healthy upstream"""
-        async with self._lock:
-            healthy_slots = [(i, s) for i, s in enumerate(self.slots) if s.healthy]
-
-            if healthy_slots:
-                healthy_slots.sort(key=lambda x: x[0])
-                new_idx = healthy_slots[0][0]
-                self._active_upstream_idx = new_idx
-                log(f"[bridge-failover] → slot[{new_idx}] = {self.slots[new_idx].label[:50]}")
-                await self._restart_bridge()
-                return
-
-            # Ни один slot не healthy → пробовать backup
-            for _ in range(FAILOVER_MAX_RETRIES):
-                if self.backup_cursor >= len(self.backup_pool):
-                    log("[bridge-failover] ❌ Backup pool исчерпан")
-                    return
-                candidate = self.backup_pool[self.backup_cursor]
-                self.backup_cursor += 1
-                log(f"[bridge-failover] Пробуем backup: {get_label(candidate)[:50]}")
-
-                ms = await _quick_test(candidate)
-                if ms is not None:
-                    worst_idx = max(range(3), key=lambda i: self.slots[i].consecutive_failures)
-                    self._stop_upstream(worst_idx)
-                    slot = self.slots[worst_idx]
-                    slot.uri = candidate
-                    slot.label = get_label(candidate)
-                    slot.download_mbps = _extract_download_mbps(candidate)
-                    slot.consecutive_failures = 0
-                    slot.healthy = True
-                    await self._start_upstream(worst_idx)
-                    self._active_upstream_idx = worst_idx
-                    await self._restart_bridge()
-                    log(f"[bridge-failover] ✅ Backup работает! slot[{worst_idx}]")
-                    return
-
-            log("[bridge-failover] ❌ Нет healthy upstream, backup исчерпан!")
-
-    # ── Upstream management ─────────────────────────────────────────
-
-    async def _start_upstream(self, idx):
-        slot = self.slots[idx]
-        if not slot.uri:
-            return
-        xray_cfg = make_xray_config(slot.uri, slot.upstream_socks_port)
-        if not xray_cfg:
-            log(f"[bridge] ❌ Не удалось распарсить slot[{idx}]")
-            return
-        proc = await start_xray(xray_cfg, slot.upstream_socks_port)
-        if proc:
-            slot.upstream_proc = proc
-            slot.healthy = True
-            log(f"[bridge] Upstream slot[{idx}] SOCKS:{slot.upstream_socks_port}  {slot.label[:40]}")
-        else:
-            log(f"[bridge] ❌ Не запустился slot[{idx}]")
-            slot.healthy = False
-
-    def _stop_upstream(self, idx):
-        slot = self.slots[idx]
-        if slot.upstream_proc:
-            stop_xray(slot.upstream_proc)
-            slot.upstream_proc = None
-
-    # ── Bridge management ───────────────────────────────────────────
-
-    async def _restart_bridge(self):
-        """Перезапустить bridge: SS inbound → SOCKS outbound на активный upstream"""
-        if self._bridge_proc:
-            log("[bridge] Остановка старого bridge...")
-            stop_xray(self._bridge_proc)
-            self._bridge_proc = None
-
-        active = self._active_upstream_idx
-        slot = self.slots[active]
-        upstream_socks_port = slot.upstream_socks_port
-
-        bridge_cfg = {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{
-                "port": BRIDGE_PORT,
-                "listen": "0.0.0.0",
-                "protocol": "shadowsocks",
-                "settings": {
-                    "method": SS_METHOD,
-                    "password": SS_PASSWORD,
-                    "udp": True,
-                    "network": "tcp,udp"
-                }
-            }],
-            "outbounds": [{
-                "tag": "proxy",
-                "protocol": "socks",
-                "settings": {
-                    "servers": [{"address": "127.0.0.1", "port": upstream_socks_port}]
-                }
-            }]
-        }
-
-        try:
-            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix="bridge_")
-            json.dump(bridge_cfg, tmp)
-            tmp.close()
-
-            kwargs = {}
-            if os.name != "nt":
-                kwargs["preexec_fn"] = os.setsid
-
-            proc = subprocess.Popen(
-                [XRAY_BIN, "run", "-c", tmp.name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **kwargs
-            )
-            proc._tmp = tmp.name
-            await asyncio.sleep(1.5)
-
-            if proc.poll() is not None:
-                log(f"[bridge] ❌ Bridge xray упал (exit={proc.poll()})")
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    pass
-                return
-
-            self._bridge_proc = proc
-            log(f"[bridge] ✅ Bridge: SS:{BRIDGE_PORT} → SOCKS:{upstream_socks_port} (slot[{active}])")
-        except Exception as e:
-            log(f"[bridge] ❌ Ошибка запуска bridge: {e}")
-
-    # ── Save bridge URI ─────────────────────────────────────────────
-
-    def _save_bridge_uri(self):
-        userinfo = base64.b64encode(f"{SS_METHOD}:{SS_PASSWORD}".encode()).decode()
-        bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_PORT}#{urllib.parse.quote('self-hosted RU 🇷🇺')}"
-
-        existing_lines = []
-        header_lines = []
-        if os.path.exists(TESTED_FILE):
-            with open(TESTED_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("#"):
-                        header_lines.append(line)
-                    elif line:
-                        existing_lines.append(line)
-
-        existing_lines = [l for l in existing_lines if not _is_bridge_uri(l)]
-
-        with open(TESTED_FILE, "w", encoding="utf-8") as f:
-            for hl in header_lines:
-                f.write(hl + "\n")
-            f.write("\n")
-            f.write(bridge_uri + "\n")
-            for l in existing_lines:
-                f.write(l + "\n")
-
-        log(f"[bridge] ✅ Bridge URI сохранён в {TESTED_FILE}")
-
-    # ── Status ──────────────────────────────────────────────────────
-
-    def get_status(self):
-        status = []
-        for i, slot in enumerate(self.slots):
-            status.append({
-                "slot": i,
-                "active": (i == self._active_upstream_idx),
-                "healthy": slot.healthy,
-                "label": (slot.label[:50] if slot.label else None),
-                "download_mbps": slot.download_mbps,
-                "upstream_socks_port": slot.upstream_socks_port,
-                "consecutive_failures": slot.consecutive_failures,
-                "last_check": slot.last_check,
-            })
-        return {
-            "bridge_port": BRIDGE_PORT,
-            "active_upstream_idx": self._active_upstream_idx,
-            "slots": status,
-            "backup_remaining": max(0, len(self.backup_pool) - self.backup_cursor),
-        }
-
-    async def _stop_all(self):
-        if self._health_task:
-            self._health_task.cancel()
-            try:
-                await self._health_task
-            except asyncio.CancelledError:
-                pass
-        if self._bridge_proc:
-            stop_xray(self._bridge_proc)
-            self._bridge_proc = None
-        for i in range(3):
-            self._stop_upstream(i)
-        for slot in self.slots:
-            slot.uri = None
-            slot.healthy = False
-            slot.consecutive_failures = 0
-
-
-def _is_bridge_uri(uri):
-    """Проверить, является ли URI нашим bridge-конфигом"""
-    return uri.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
-
-
-async def _ping_upstream(socks_port):
-    """Измерить задержку upstream SOCKS-порта"""
-    connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
-    try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            t0 = time.perf_counter()
-            async with session.get(
-                PING_TEST_URL,
-                timeout=aiohttp.ClientTimeout(total=3),
-                allow_redirects=False, ssl=False
-            ) as resp:
-                await resp.read()
-            return (time.perf_counter() - t0) * 1000
-    except Exception:
-        return None
-    finally:
-        await connector.close()
-
-
-async def _quick_test(uri):
-    """Быстрый тест: один HTTP-запрос через конфиг"""
-    socks_port = find_free_port(20000, 0)
-    xray_cfg = make_xray_config(uri, socks_port)
-    if not xray_cfg:
-        return None
-    proc = await start_xray(xray_cfg, socks_port)
-    if not proc:
-        return None
-    try:
-        return await _ping_upstream(socks_port)
-    finally:
-        stop_xray(proc)
-
+import uuid
+BRIDGE_IP        = "95.165.137.180"
+BRIDGE_PORT      = 8443
+BRIDGE_UUID      = str(uuid.uuid5(uuid.NAMESPACE_DNS, "self-hosted-ru-bridge"))
+BRIDGE_SOCKS_PORT = 15000   # локальный SOCKS лучшего конфига
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ОБЩИЕ УТИЛИТЫ
@@ -506,22 +142,8 @@ def get_label(uri):
     return uri[:60]
 
 
-def _extract_download_mbps(uri):
-    """Извлечь download Mbps из лейбла URI"""
-    try:
-        label = uri.split("#", 1)[1]
-        label = urllib.parse.unquote(label)
-        m = re.search(r"(\d+)\s*/\s*(?:\d+\s*)?mbps", label, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
-        m = re.search(r"(\d+)mbps", label, re.IGNORECASE)
-        return int(m.group(1)) if m else 0
-    except Exception:
-        return 0
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ГЕНЕРАЦИЯ XRAY-КОНФИГОВ
+#  ГЕНЕРАЦИЯ XRAY-КОНФИГОВ  (общая для обоих тестов)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _base_xray(socks_port, outbound):
@@ -574,509 +196,923 @@ def _vless_xray(uri, socks_port):
         stream["realitySettings"] = {"serverName": sni, "fingerprint": fp,
                                       "publicKey": pbk, "shortId": sid, "spiderX": params.get("spx", "/")}
     else:
-        stream["security"] = security
+        stream["security"] = "none"
 
-    return _base_xray(socks_port, {
+    outbound = {
         "protocol": "vless",
         "settings": {"vnext": [{"address": host, "port": port,
-                                 "users": [{"id": user_id, "flow": flow, "encryption": "none"}]}]},
+                                 "users": [{"id": user_id, "encryption": "none", "flow": flow}]}]},
         "streamSettings": stream
-    })
+    }
+    return _base_xray(socks_port, outbound)
 
 
 def _vmess_xray(uri, socks_port):
+    b64 = uri[len("vmess://"):].split("#")[0]
+    b64 += "=" * (4 - len(b64) % 4)
     try:
-        payload = base64.b64decode(uri[len("vmess://"):]).decode("utf-8")
-        info = json.loads(payload)
+        data = json.loads(base64.b64decode(b64).decode())
     except Exception:
         return None
-    host = info.get("add", "")
-    port = int(info.get("port", 443))
-    user_id = info.get("id", "")
-    alter_id = int(info.get("aid", 0))
-    net = info.get("net", info.get("type", "tcp"))
-    security = info.get("tls", "none")
-    sni = info.get("sni", host)
-    path = info.get("path", "/")
-    host_h = info.get("host", host)
-    svc = info.get("path", "")
+
+    host     = data.get("add", "")
+    port     = int(data.get("port", 443))
+    user_id  = data.get("id", "")
+    alter_id = int(data.get("aid", 0))
+    net      = data.get("net", "tcp")
+    tls      = data.get("tls", "")
+    sni      = data.get("sni", host)
+    path     = data.get("path", "/")
+    host_h   = data.get("host", host)
 
     stream = {"network": net}
     if net == "ws":
         stream["wsSettings"] = {"path": path, "headers": {"Host": host_h}}
-    elif net == "grpc":
-        stream["grpcSettings"] = {"serviceName": svc, "multiMode": False, "mode": "gun"}
     else:
         stream["tcpSettings"] = {}
 
-    if security in ("tls", "xtls"):
+    if tls == "tls":
         stream["security"] = "tls"
-        stream["tlsSettings"] = {"serverName": sni, "fingerprint": "chrome"}
+        stream["tlsSettings"] = {"serverName": sni, "allowInsecure": True}
+    else:
+        stream["security"] = "none"
 
-    return _base_xray(socks_port, {
+    outbound = {
         "protocol": "vmess",
         "settings": {"vnext": [{"address": host, "port": port,
-                                 "users": [{"id": user_id, "alterId": alter_id}]}]},
+                                 "users": [{"id": user_id, "alterId": alter_id, "security": "auto"}]}]},
         "streamSettings": stream
-    })
+    }
+    return _base_xray(socks_port, outbound)
 
 
 def _trojan_xray(uri, socks_port):
     m = re.match(r"trojan://([^@]+)@([^:]+):(\d+)\??([^#]*)", uri)
     if not m:
         return None
-    pwd, host, port = m.group(1), m.group(2), int(m.group(3))
+    password, host, port = m.group(1), m.group(2), int(m.group(3))
     params = dict(urllib.parse.parse_qsl(m.group(4)))
-    net = params.get("type", "tcp")
-    security = params.get("security", "none")
-    sni = params.get("sni", host)
-    fp = params.get("fp", "chrome") or "chrome"
-    path = params.get("path", "/")
+    sni    = params.get("sni", host)
+    net    = params.get("type", "tcp")
+    path   = params.get("path", "/")
     host_h = params.get("host", host)
-    svc = params.get("serviceName", "")
 
-    stream = {"network": net}
+    stream = {"network": net, "security": "tls",
+               "tlsSettings": {"serverName": sni, "allowInsecure": True}}
     if net == "ws":
         stream["wsSettings"] = {"path": path, "headers": {"Host": host_h}}
-    elif net == "grpc":
-        stream["grpcSettings"] = {"serviceName": svc, "multiMode": False, "mode": "gun"}
-    else:
-        stream["tcpSettings"] = {}
 
-    if security == "tls":
-        stream["security"] = "tls"
-        stream["tlsSettings"] = {"serverName": sni, "fingerprint": fp}
-
-    return _base_xray(socks_port, {
+    outbound = {
         "protocol": "trojan",
-        "settings": {"servers": [{"address": host, "port": port, "password": pwd}]},
+        "settings": {"servers": [{"address": host, "port": port, "password": password}]},
         "streamSettings": stream
-    })
+    }
+    return _base_xray(socks_port, outbound)
 
 
 def _ss_xray(uri, socks_port):
-    m = re.match(r"ss://([^@]+)@([^:]+):(\d+)", uri)
-    if not m:
-        return None
-    creds = base64.b64decode(m.group(1).split("=", 1)[1]).decode("utf-8")
-    method, password = creds.split(":", 1)
-    host, port = m.group(2), int(m.group(3))
+    raw = uri[len("ss://"):]
+    if "#" in raw:
+        raw = raw.rsplit("#", 1)[0]
+    try:
+        if "@" in raw:
+            userinfo, hostport = raw.rsplit("@", 1)
+            try:
+                decoded = base64.b64decode(userinfo + "==").decode()
+                method, password = decoded.split(":", 1)
+            except Exception:
+                method, password = userinfo.split(":", 1)
+        else:
+            decoded = base64.b64decode(raw + "==").decode()
+            method_pass, hostport = decoded.split("@", 1)
+            method, password = method_pass.split(":", 1)
 
-    return _base_xray(socks_port, {
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port = int(port_s.strip("/").split("?")[0])
+        else:
+            return None
+    except Exception:
+        return None
+
+    outbound = {
         "protocol": "shadowsocks",
         "settings": {"servers": [{"address": host, "port": port,
-                                   "method": method, "password": password}]},
-        "streamSettings": {"network": "tcp"}
-    })
+                                   "method": method, "password": password}]}
+    }
+    return _base_xray(socks_port, outbound)
 
 
 def make_xray_config(uri, socks_port):
-    uri = clean_url(uri)
-    if uri.startswith("vless://"):
-        return _vless_xray(uri, socks_port)
-    elif uri.startswith("vmess://"):
-        return _vmess_xray(uri, socks_port)
-    elif uri.startswith("trojan://"):
-        return _trojan_xray(uri, socks_port)
-    elif uri.startswith("ss://"):
-        return _ss_xray(uri, socks_port)
+    uri = uri.replace("&amp;", "&")
+    try:
+        if uri.startswith("vless://"):   return _vless_xray(uri, socks_port)
+        if uri.startswith("vmess://"):   return _vmess_xray(uri, socks_port)
+        if uri.startswith("trojan://"):  return _trojan_xray(uri, socks_port)
+        if uri.startswith("ss://"):      return _ss_xray(uri, socks_port)
+    except Exception:
+        pass
     return None
 
 
-async def start_xray(config_json, socks_port):
+def get_server_addr(xray_cfg):
+    try:
+        out = xray_cfg["outbounds"][0]["settings"]
+        servers = out.get("vnext") or out.get("servers") or []
+        if servers:
+            return "{}:{}".format(servers[0].get("address", "?"), servers[0].get("port", "?"))
+    except Exception:
+        pass
+    return "?"
+
+
+async def start_xray(config, socks_port):
     try:
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix="xray_")
-        json.dump(config_json, tmp)
+        json.dump(config, tmp)
         tmp.close()
+
+        # Временно: пишем stderr в файл для диагностики
+        log_path = tmp.name.replace(".json", ".log")
+        log_file = open(log_path, "w")
+
         kwargs = {}
         if os.name != "nt":
             kwargs["preexec_fn"] = os.setsid
-        proc = subprocess.Popen([XRAY_BIN, "run", "-c", tmp.name],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
-        proc._tmp = tmp.name
-        await asyncio.sleep(1)
+
+        proc = subprocess.Popen(
+            [XRAY_BIN, "run", "-c", tmp.name],
+            stdout=log_file,
+            stderr=log_file,
+            **kwargs
+        )
+        await asyncio.sleep(1.5)
+
+        # Читаем лог и выводим
+        log_file.flush()
+        with open(log_path, "r") as f:
+            output = f.read().strip()
+        if output:
+            log(f"[xray:{socks_port}] {output[:500]}")
+
         if proc.poll() is not None:
-            log(f"[!] xray упал на порту {socks_port} (exit={proc.poll()})")
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+            log(f"[xray:{socks_port}] ❌ Процесс завершился (exit={proc.poll()})")
+            os.unlink(tmp.name)
             return None
+
+        proc._tmp = tmp.name
         return proc
-    except Exception as e:
-        log(f"[!] Ошибка запуска xray: {e}")
+    except FileNotFoundError:
+        log(f"[!] xray не найден: '{XRAY_BIN}'. Скачайте: https://github.com/XTLS/Xray-core/releases")
+        sys.exit(1)
+    except Exception:
         return None
 
 
 def stop_xray(proc):
     try:
-        if proc.poll() is None:
-            try:
-                os.kill(proc.pid, signal.SIGTERM)
-            except Exception:
-                proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
+        if os.name != "nt":
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=3)
     except Exception:
-        pass
-    finally:
         try:
-            if hasattr(proc, "_tmp") and os.path.exists(proc._tmp):
-                os.unlink(proc._tmp)
+            proc.kill()
+        except Exception:
+            pass
+    tmp = getattr(proc, "_tmp", None)
+    if tmp and os.path.exists(tmp):
+        try:
+            os.unlink(tmp)
         except Exception:
             pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ПИНГ-ТЕСТ
+#  ШАГ 1 — PING-ТЕСТ (vpn_ping_test)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def ping_one(uri):
-    port = find_free_port(PING_SOCKS_BASE, 0)
-    xray_cfg = make_xray_config(uri, port)
-    if not xray_cfg:
-        return None, uri
-    proc = await start_xray(xray_cfg, port)
-    if not proc:
-        return None, uri
-    best = None
-    for _ in range(PING_TRIES):
-        try:
-            connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
-            try:
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    t0 = time.perf_counter()
-                    async with session.get(PING_TEST_URL, timeout=aiohttp.ClientTimeout(total=PING_TIMEOUT)) as resp:
-                        await resp.read()
-                    elapsed = (time.perf_counter() - t0) * 1000
-                    if best is None or elapsed < best:
-                        best = elapsed
-            finally:
-                await connector.close()
-        except Exception:
-            pass
-        finally:
-            await asyncio.sleep(0.2)
-    stop_xray(proc)
-    return best, uri
-
-
-async def vpn_ping_test():
-    log("── Загрузка конфигов ──")
+def extract_host_port(config):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(CONFIG_URL, ssl=False) as resp:
-                text = await resp.text()
-    except Exception as e:
-        log(f"[!] Не удалось скачать конфиги: {e}")
-        return []
-
-    raw = []
-    for line in text.splitlines():
-        line = line.strip()
-        for part in line.split():
-            part = part.strip()
-            if part.startswith(("vless://", "vmess://", "trojan://", "ss://")):
-                raw.append(part)
-    log(f"[ping] Всего сырых строк: {len(raw)}")
-
-    cleaned = []
-    seen = set()
-    for u in raw:
-        u = clean_url(u)
-        h = hashlib.md5(u.encode()).hexdigest()[:12]
-        if h not in seen:
-            seen.add(h)
-            cleaned.append(u)
-    log(f"[ping] Уникальных после очистки: {len(cleaned)}")
-
-    tasks = [ping_one(u) for u in cleaned]
-    results = []
-    sem = asyncio.Semaphore(PING_MAX_WORKERS)
-
-    async def limited(uri):
-        async with sem:
-            return await ping_one(uri)
-
-    coros = [limited(u) for u in cleaned]
-    results = await asyncio.gather(*coros)
-
-    working = []
-    for ms, uri in results:
-        if ms is not None:
-            working.append(uri)
-
-    working.sort(key=lambda u: _extract_download_mbps(u) if _extract_download_mbps(u) > 0 else float('inf'))
-
-    log(f"[ping] Рабочих: {len(working)}/{len(cleaned)}")
-    return working
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  СПИД-ТЕСТ
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def speed_one(uri):
-    port = find_free_port(SPEED_SOCKS_BASE, 0)
-    xray_cfg = make_xray_config(uri, port)
-    if not xray_cfg:
-        return None
-    proc = await start_xray(xray_cfg, port)
-    if not proc:
-        return None
-
-    connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
-    result = None
-
-    try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # IP
-            try:
-                async with session.get(IP_API, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as resp:
-                    ip_info = await resp.json()
-            except Exception:
-                ip_info = {"country": "??", "query": "???"}
-
-            # Download
-            dl_speeds = []
-            for url in DOWNLOAD_URLS:
+        if '://' in config:
+            protocol, rest = config.split('://', 1)
+            if '@' in rest:
+                host_part = rest.split('@')[1].split('?')[0]
+                if ':' in host_part:
+                    host, port = host_part.split(':')
+                    return f"{host}:{port}"
+            elif protocol == 'vmess':
                 try:
-                    t0 = time.perf_counter()
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=SPEED_TIMEOUT)) as resp:
-                        while True:
-                            chunk = await resp.content.read(1024 * 1024)
-                            if not chunk:
-                                break
-                    elapsed = time.perf_counter() - t0
-                    if elapsed > 0:
-                        dl_speeds.append(resp.content.length / elapsed * 8 / 1_000_000)
+                    decoded = base64.b64decode(rest).decode('utf-8')
+                    vmess_data = json.loads(decoded)
+                    if 'add' in vmess_data and 'port' in vmess_data:
+                        return f"{vmess_data['add']}:{vmess_data['port']}"
                 except Exception:
                     pass
+    except Exception:
+        pass
+    return None
 
-            # Upload
-            try:
-                t0 = time.perf_counter()
-                payload = bytearray(os.urandom(min(UPLOAD_BYTES, 5 * 1024 * 1024)))
-                async with session.post(UPLOAD_URL, data=payload,
-                                        timeout=aiohttp.ClientTimeout(total=SPEED_TIMEOUT), ssl=False) as resp:
-                    await resp.read()
-                elapsed = time.perf_counter() - t0
-                if elapsed > 0:
-                    ul_mbps = len(payload) / elapsed * 8 / 1_000_000
-                else:
-                    ul_mbps = 0
-            except Exception:
-                ul_mbps = 0
 
-            dl_avg = sum(dl_speeds) / len(dl_speeds) if dl_speeds else 0
+def fetch_configs(url):
+    log(f"[ping] Загрузка конфигов: {url}")
+    text = None
+    while text is None:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            break
+        except Exception as e:
+            log(f"[ping] Ошибка загрузки: {e}, повтор через 5 сек...")
+            time.sleep(5)
 
-            label = get_label(uri)
-            flag = get_flag(ip_info.get("country", "??"))
-            proto = protocol_name(uri)
-            ip = ip_info.get("query", "???")
+    configs = []
+    seen_hosts = set()
+    for line in text.splitlines():
+        line = line.strip().replace("&#38;amp;", "&#38;")
+        line = line.strip().replace("&" + "amp;", "&")
+        if not line or line.startswith("#"):
+            continue
+        if re.match(r"^(vless|vmess|trojan|ss)://", line):
+            cleaned = clean_url(line)
+            if cleaned and len(cleaned) > 20:
+                host_port = extract_host_port(cleaned)
+                if host_port and host_port not in seen_hosts:
+                    seen_hosts.add(host_port)
+                    configs.append(cleaned)
+                elif not host_port:
+                    configs.append(cleaned)
 
-            enriched = f"{uri}  {flag} {proto}  {ip}  ↓{dl_avg:.0f} / ↑{ul_mbps:.0f} mbps"
-            return enriched
+    # Удаляем дубликаты сохраняя порядок
+    configs = list(dict.fromkeys(configs))
+
+    log(f"[ping] Найдено конфигов: {len(configs)} (уникальных хостов: {len(seen_hosts)})")
+    return configs
+
+
+async def measure_via_proxy(socks_port, test_url, timeout):
+    connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            t0 = time.perf_counter()
+            async with session.get(test_url,
+                                   timeout=aiohttp.ClientTimeout(total=timeout),
+                                   allow_redirects=False, ssl=False) as resp:
+                await resp.read()
+            return (time.perf_counter() - t0) * 1000
+    except Exception:
+        return None
     finally:
         await connector.close()
+
+
+async def ping_one(uri, idx, total, port_offset):
+    label = get_label(uri)
+    result = {"label": label, "uri": uri, "ping": None, "error": None}
+
+    socks_port = find_free_port(PING_SOCKS_BASE, port_offset * 3)
+    xray_cfg = make_xray_config(uri, socks_port)
+
+    if xray_cfg is None:
+        result["error"] = "parse_error"
+        return result
+
+    proc = await start_xray(xray_cfg, socks_port)
+    if proc is None:
+        result["error"] = "xray_failed"
+        return result
+
+    try:
+        pings = []
+        for _ in range(PING_TRIES):
+            ms = await measure_via_proxy(socks_port, PING_TEST_URL, PING_TIMEOUT)
+            if ms is not None:
+                pings.append(ms)
+
+        if pings:
+            result["ping"] = sum(pings) / len(pings)
+            log(f"  [{idx:>4}/{total}] {result['ping']:>7.1f} ms  {label[:50]}")
+        else:
+            result["error"] = "timeout"
+    finally:
         stop_xray(proc)
 
+    return result
 
-async def speed_test():
-    if not os.path.exists(WORKING_FILE):
-        log("[!] working_configs.txt не найден — пропускаем speed-test")
-        return []
 
-    with open(WORKING_FILE, "r", encoding="utf-8") as f:
-        uris = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
-    log(f"[speed] Тестирование {len(uris)} конфилов...")
-
-    sem = asyncio.Semaphore(SPEED_MAX_WORKERS)
+async def run_ping_test(configs):
+    sem = asyncio.Semaphore(PING_MAX_WORKERS)
+    total = len(configs)
     results = []
+    counter = [0]
 
-    async def limited(uri):
+    async def bounded(uri, offset):
         async with sem:
-            return await speed_one(uri)
-
-    coros = [limited(u) for u in uris]
-    raw_results = await asyncio.gather(*coros)
-
-    for r in raw_results:
-        if r is not None:
+            counter[0] += 1
+            r = await ping_one(uri, counter[0], total, offset)
             results.append(r)
 
-    good = [r for r in results if _extract_download_mbps(r) >= SPEED_MIN_MBPS]
-    good.sort(key=lambda r: _extract_download_mbps(r), reverse=True)
-
-    log(f"[speed] Скорость ≥{SPEED_MIN_MBPS} Mbps: {len(good)}/{len(results)}")
-    log(f"[speed] Всего протестировано: {len(results)}/{len(uris)}")
-
-    if results:
-        with open(TESTED_FILE, "w", encoding="utf-8") as f:
-            f.write(f"# Total: {len(results)} configs  |  Good(>={SPEED_MIN_MBPS} Mbps): {len(good)}\n")
-            f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Bridge: SS {BRIDGE_IP}:{BRIDGE_PORT}  |  Method: {SS_METHOD}  |  Pass: {SS_PASSWORD}\n")
-            f.write("\n")
-            for r in results:
-                f.write(r + "\n")
-        log(f"[speed] Сохранено в {TESTED_FILE}")
-
+    await asyncio.gather(*[bounded(uri, i) for i, uri in enumerate(configs)])
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  REST API
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def handle_api_request(reader, writer):
+def get_country_by_ip(host, db_path='/usr/share/GeoIP/GeoLite2-Country.mmdb'):
+    """Получить флаг страны по IP/домену из локальной базы GeoIP"""
     try:
-        header = await asyncio.wait_for(reader.read(8192), timeout=10)
-        request = header.decode("utf-8", errors="replace")
-        method, path, _ = request.split("\r\n")[0].split(" ")
+        import geoip2.database
+        import socket
+    except ImportError:
+        return "🌍"
+    
+    try:
+        # Извлекаем хост из URI
+        h = host
+        if '://' in h:
+            h = h.split('://')[1]
+        if '@' in h:
+            h = h.split('@')[1]
+        h = h.split(':')[0].split('?')[0]
+        
+        # Разрешаем домен в IP
+        ip = socket.gethostbyname(h)
+        
+        # Определяем страну по базе
+        with geoip2.database.Reader(db_path) as reader:
+            response = reader.country(ip)
+            return get_flag(response.country.iso_code)
+    except Exception:
+        pass
+    return "🌍"
 
-        if path == "/status":
-            status = _build_status()
-            body = json.dumps(status, ensure_ascii=False, indent=2)
-            resp = (f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
-        elif path == "/configs":
-            body = ""
-            for fname in (TESTED_FILE, WORKING_FILE):
-                if os.path.exists(fname):
-                    with open(fname, "r", encoding="utf-8") as f:
-                        body += f.read() + "\n"
-            resp = (f"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
-        elif path == "/ping" and method in ("POST", "GET"):
-            result = await _api_ping()
-            body = json.dumps(result, ensure_ascii=False, indent=2)
-            code = 200
-            resp = (f"HTTP/1.1 {code} OK\r\nContent-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
-        elif path == "/speed" and method == "POST":
-            result = await _api_speed()
-            body = json.dumps(result, ensure_ascii=False, indent=2)
-            code = 200
-            resp = (f"HTTP/1.1 {code} OK\r\nContent-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
-        else:
-            body = json.dumps({"error": "not found"}, ensure_ascii=False)
-            resp = (f"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
 
-        writer.write(resp.encode("utf-8"))
-    except Exception as e:
+def save_working_configs(results):
+    ok = sorted([r for r in results if r["ping"] is not None], key=lambda x: x["ping"])
+    if not ok:
+        log("[ping] Нет рабочих конфигов")
+        return 0
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(WORKING_FILE, "w", encoding="utf-8") as f:
+        f.write("#profile-title: Рабочие\n")
+        f.write("#profile-update-interval: 1\n")
+        f.write("#support-url: https://t.me/ine4eg\n")
+        f.write("#announce: t.me/ine4eg\n")
+        f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
+
+        for r in ok:
+            # Получаем протокол
+            proto = protocol_name(r["uri"])
+            
+            # Получаем флаг страны по IP
+            flag = get_country_by_ip(r["uri"])
+            
+            # Создаем красивую метку
+            label = f"{flag} {proto} ping: {r['ping']:.0f}ms, t.me/ine4eg"
+            
+            # Пересобираем URI
+            rebuilt_uri = rebuild_uri(r["uri"].strip(), label)
+            f.write(rebuilt_uri + "\n")
+
+    log(f"[ping] Сохранено {len(ok)} рабочих конфигов -> {WORKING_FILE}")
+    return len(ok)
+
+
+async def do_ping_stage():
+    log("=" * 60)
+    log("  ЭТАП 1: PING-ТЕСТ")
+    log("=" * 60)
+
+    configs = fetch_configs(CONFIG_URL)
+    if not configs:
+        log("[ping] Нет конфигов для проверки")
+        return 0
+
+    t0 = time.perf_counter()
+    results = await run_ping_test(configs)
+    elapsed = time.perf_counter() - t0
+
+    ok = [r for r in results if r["ping"] is not None]
+    timeout = [r for r in results if r.get("error") == "timeout"]
+    log(f"[ping] Завершено за {elapsed:.0f} сек. OK={len(ok)} Таймаут={len(timeout)}")
+
+    if ok:
+        ok_sorted = sorted(ok, key=lambda x: x["ping"])
+        log(f"[ping] Лучший: {ok_sorted[0]['ping']:.1f} ms — {ok_sorted[0]['label'][:50]}")
+
+    return save_working_configs(results)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ШАГ 2 — SPEED-ТЕСТ (speed_test_configs)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_configs_file(filepath):
+    """Читает файл, пропускает заголовки (#profile-*), удаляет пустые строки и дубликаты"""
+    configs = []
+    with open(filepath, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Пропускаем комментарии кроме subscription-userinfo (Clash-заголовки)
+            if line.startswith("#"):
+                continue
+            cleaned = clean_url(line)
+            if cleaned and len(cleaned) > 20:
+                configs.append(cleaned)
+    return list(dict.fromkeys(configs))
+
+
+def normalize_vmess_config(d):
+    order = ["v","ps","add","port","id","aid","net","type","host","path","tls","sni","alpn","fp","security","scy"]
+    norm = {k: d[k] for k in order if k in d}
+    norm.update({k: v for k, v in d.items() if k not in norm})
+    return norm
+
+
+def rebuild_uri(uri, label):
+    clean = uri.split('#')[0]
+    quoted = urllib.parse.quote(label)
+    if uri.startswith("vmess://"):
         try:
-            err = json.dumps({"error": str(e)}, ensure_ascii=False)
-            resp = (f"HTTP/1.1 500 Error\r\nContent-Type: application/json\r\n"
-                    f"Content-Length: {len(err)}\r\nConnection: close\r\n\r\n{err}")
-            writer.write(resp.encode("utf-8"))
+            b64 = clean[8:]
+            while len(b64) % 4:
+                b64 += '='
+            cfg = json.loads(base64.b64decode(b64).decode())
+            cfg['ps'] = label
+            cfg = normalize_vmess_config(cfg)
+            new_b64 = base64.b64encode(json.dumps(cfg, separators=(',', ':')).encode()).decode()
+            return f"vmess://{new_b64}#{quoted}"
         except Exception:
-            pass
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+            return f"{clean}#{quoted}"
+    return f"{clean}#{quoted}"
 
 
-def _build_status():
-    last_ping = None
-    if os.path.exists(WORKING_FILE):
-        last_ping = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(WORKING_FILE)))
-    last_speed = None
-    if os.path.exists(TESTED_FILE):
-        last_speed = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(TESTED_FILE)))
+async def speed_test_one(uri, idx):
+    socks_port = SPEED_SOCKS_BASE + (idx % 1000)
+    if socks_port > 65535:
+        socks_port = 12000 + (idx % 1000)
 
-    bridge = None
-    if _bridge_manager:
-        bridge = _bridge_manager.get_status()
+    config = make_xray_config(uri, socks_port)
+    if not config:
+        return None
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(config, f)
+        tmp_file = f.name
+
+    proc = subprocess.Popen(
+        [XRAY_BIN, 'run', '-c', tmp_file],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    await asyncio.sleep(0.7)
+
+    if proc.poll() is not None:
+        os.unlink(tmp_file)
+        return None
+
+    try:
+        result = await asyncio.wait_for(_measure_speed(uri, socks_port), timeout=SPEED_TIMEOUT)
+    except asyncio.TimeoutError:
+        log(f"[speed] TIMEOUT ({SPEED_TIMEOUT}s) конфиг #{idx}")
+        result = None
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        proc.kill()
+    try:
+        os.unlink(tmp_file)
+    except Exception:
+        pass
+
+    return result
+
+
+async def _measure_speed(uri, port):
+    """
+    Измеряет download и upload скорость через SOCKS-прокси.
+    Использует 20 МБ для каждого направления с пер-конфиг таймаут-лимитом,
+    чтобы очень медленные конфиги не вешали тест бесконечно.
+    """
+    # Оставляем ~10 сек на handshake + IP-запрос, остальное — на dl + up
+    _per_request_timeout = max(SPEED_TIMEOUT - 10, 60)
+
+    try:
+        connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
+        async with aiohttp.ClientSession(connector=connector) as session:
+            down_mbps = 0
+            up_mbps   = 0
+
+            # ── DOWNLOAD ──────────────────────────────────────────────
+            for url in DOWNLOAD_URLS:
+                try:
+                    start = time.time()
+                    async with session.get(url,
+                                           timeout=aiohttp.ClientTimeout(total=_per_request_timeout),
+                                           ssl=False) as resp:
+                        data = await resp.read()
+                    elapsed = time.time() - start
+                    if elapsed > 0:
+                        down_mbps = (len(data) * 8) / elapsed / 1e6
+                    if down_mbps > 0:
+                        break
+                except Exception:
+                    continue
+
+            if down_mbps == 0:
+                return None
+
+            # ── UPLOAD ────────────────────────────────────────────────
+            try:
+                payload = b'\x00' * UPLOAD_BYTES
+                start = time.time()
+                async with session.post(UPLOAD_URL, data=payload,
+                                        timeout=aiohttp.ClientTimeout(total=_per_request_timeout)) as resp:
+                    await resp.read()
+                elapsed = time.time() - start
+                if elapsed > 0:
+                    up_mbps = (len(payload) * 8) / elapsed / 1e6
+            except Exception:
+                pass
+
+            country = None
+            try:
+                async with session.get(IP_API, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    data = await resp.json()
+                    country = data.get('countryCode')
+            except Exception:
+                pass
+
+            if down_mbps >= SPEED_MIN_MBPS:
+                proto = protocol_name(uri)
+                flag  = get_flag(country) if country else "🏳"
+                up_str = f"/{up_mbps:.0f}" if up_mbps > 0 else ""
+                label = f"{proto} {flag} {down_mbps:.0f}{up_str}mbps t.me/ine4eg"
+                new_uri = rebuild_uri(uri, label)
+                log(f"[speed] OK ↓{down_mbps:.1f}/↑{up_mbps:.1f} Mbps  {proto} {flag}")
+                return new_uri
+            else:
+                return None
+    except Exception:
+        return None
+
+
+class SpeedTester:
+    def __init__(self):
+        self.semaphore = asyncio.Semaphore(SPEED_MAX_WORKERS)
+
+    async def test_all(self, configs):
+        log(f"[speed] Запуск тестирования {len(configs)} конфигов (workers={SPEED_MAX_WORKERS})")
+
+        async def bounded(uri, idx):
+            async with self.semaphore:
+                return await speed_test_one(uri, idx)
+
+        tasks = [asyncio.create_task(bounded(uri, i)) for i, uri in enumerate(configs)]
+        results = []
+        for i, task in enumerate(asyncio.as_completed(tasks)):
+            r = await task
+            if r:
+                results.append(r)
+            if (i + 1) % max(1, len(configs) // 10) == 0:
+                pct = (i + 1) / len(configs) * 100
+                log(f"[speed] Прогресс: {pct:.0f}% ({i+1}/{len(configs)}) — найдено {len(results)} рабочих")
+
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BRIDGE — self-hosted Shadowsocks → лучший конфиг
+# ═══════════════════════════════════════════════════════════════════════════════
+import hashlib
+
+SS_METHOD    = "chacha20-ietf-poly1305"
+SS_PASSWORD  = hashlib.md5(b"self-hosted-ru-bridge").hexdigest()  # deterministic 32-char
+
+# Храним PIDs bridge-процессов для перезапуска при новом цикле
+_bridge_procs = []
+
+def _extract_download_mbps(uri):
+    """Извлечь download Mbps из лейбла URI (после #)"""
+    try:
+        label = uri.split("#", 1)[1]
+        # URL-decode лейбла (пробелы могут быть %20)
+        label = urllib.parse.unquote(label)
+        # Ищем паттерн вроде "123mbps" или "123/45mbps"
+        m = re.search(r"(\d+)\s*/\s*(?:\d+\s*)?mbps", label, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        # Попробуем просто число перед mbps
+        m = re.search(r"(\d+)mbps", label, re.IGNORECASE)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+def find_best_config():
+    """Найти конфиг с максимальной download-скоростью из tested_configs.txt"""
+    if not os.path.exists(TESTED_FILE):
+        return None
+    configs = parse_configs_file(TESTED_FILE)
+    if not configs:
+        return None
+    # Исключаем bridge URI и конфиги со скоростью 0
+    real_configs = [
+        c for c in configs
+        if not c.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
+        and _extract_download_mbps(c) > 0
+    ]
+    if not real_configs:
+        return None
+    return max(real_configs, key=_extract_download_mbps)
+
+def _build_best_outbound_uri(best_uri, socks_port):
+    """
+    Берём URI лучшего конфига и возвращаем его «нативный» outbound-конфиг
+    (host + port) для SOCKS-переадресации.
+    """
+    # Парсим хост:порт из best_uri
+    m = re.match(r"(?:vless|vmess|trojan|ss)://[^@]+@([^:]+):(\d+)", best_uri)
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
+
+def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
+    """
+    Создаём xray-конфиг:
+      inbound  → Shadowsocks на 0.0.0.0:bridge_inbound_port
+      outbound → SOCKS через upstream_socks_port (лучший конфиг)
+    """
+    host, port = _build_best_outbound_uri(best_uri, upstream_socks_port)
+    if not host:
+        return None
 
     return {
-        "uptime_seconds": time.time() - START_TIME,
-        "last_ping": last_ping,
-        "last_speedtest": last_speed,
-        "config_url": CONFIG_URL,
-        "working_file": WORKING_FILE,
-        "tested_file": TESTED_FILE,
-        "bridge": bridge,
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "port": bridge_inbound_port,
+            "listen": "0.0.0.0",
+            "protocol": "shadowsocks",
+            "settings": {
+                "method": SS_METHOD,
+                "password": SS_PASSWORD,
+                "udp": True,
+                "network": "tcp,udp"
+            }
+        }],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "socks",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": upstream_socks_port
+                    }]
+                }
+            }
+        ]
+        # routing убран — весь трафик идёт в proxy (upstream socks)
     }
 
-
-async def _api_ping():
-    working = await vpn_ping_test()
-    if working:
-        with open(WORKING_FILE, "w", encoding="utf-8") as f:
-            for u in working:
-                f.write(u + "\n")
-    return {"status": "ok", "working": len(working)}
+def _build_upstream_xray(best_uri, socks_port):
+    """Создаём xray-конфиг лучшего конфига с SOCKS на socks_port."""
+    return make_xray_config(best_uri, socks_port)
 
 
-async def _api_speed():
-    results = await speed_test()
-    good = [r for r in results if _extract_download_mbps(r) >= SPEED_MIN_MBPS]
-    return {"status": "ok", "tested": len(results), "good": len(good)}
+async def create_bridge(best_uri):
+    """
+    Создаёт мост:
+      1. Запускаем лучший конфиг (best_uri) на SOCKS порту (BRIDGE_SOCKS_PORT)
+      2. Запускаем bridge xray (VLESS без TLS → SOCKS лучшего)
+      3. Добавляем bridge URI в начало tested_configs.txt
+    """
+    if not best_uri:
+        log("[bridge] best_uri не передан, пропускаем")
+        return
+
+    log("=" * 60)
+    log("  BRIDGE: Создание self-hosted Shadowsocks моста")
+    log("=" * 60)
+
+    dl = _extract_download_mbps(best_uri)
+    log(f"[bridge] Лучший конфиг: ↓{dl} Mbps — {get_label(best_uri)[:50]}")
+
+    # ── Остановить старые bridge-процессы ─────────────────────────────
+    for proc in _bridge_procs:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _bridge_procs.clear()
+
+    # ── Запустить лучший конфиг как SOCKS ─────────────────────────────
+    upstream_cfg = _build_upstream_xray(best_uri, BRIDGE_SOCKS_PORT)
+    if not upstream_cfg:
+        log("[bridge] Не удалось создать конфиг лучшего, пропускаем")
+        return
+
+    upstream_proc = await start_xray(upstream_cfg, BRIDGE_SOCKS_PORT)
+    if not upstream_proc:
+        log("[bridge] Не удалось запустить xray лучшего конфига")
+        return
+    _bridge_procs.append(upstream_proc)
+    log(f"[bridge] Upstream xray запущен (SOCKS :{BRIDGE_SOCKS_PORT})")
+
+    # ── Запустить bridge Shadowsocks ───────────────────────────────────
+    bridge_cfg = _build_bridge_xray(best_uri, BRIDGE_PORT, BRIDGE_SOCKS_PORT)
+    if not bridge_cfg:
+        log("[bridge] Не удалось создать bridge-конфиг")
+        return
+
+    bridge_proc = await start_xray(bridge_cfg, BRIDGE_PORT)
+    if not bridge_proc:
+        log("[bridge] Не удалось запустить bridge xray")
+        return
+    _bridge_procs.append(bridge_proc)
+    log(f"[bridge] Bridge xray запущен (Shadowsocks :{BRIDGE_PORT})")
+
+    # ── Сгенерировать bridge URI ──────────────────────────────────────
+    bridge_label = "self-hosted RU 🇷🇺"
+    userinfo = base64.b64encode(f"{SS_METHOD}:{SS_PASSWORD}".encode()).decode()
+    bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_PORT}#{urllib.parse.quote(bridge_label)}"
+    log(f"[bridge] URI: {bridge_uri}")
+
+    # ── Добавить в начало tested_configs.txt ──────────────────────────
+    existing_lines = []
+    header_lines = []
+    if os.path.exists(TESTED_FILE):
+        with open(TESTED_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    header_lines.append(line)
+                elif line:
+                    existing_lines.append(line)
+
+    # Удаляем старый bridge URI из списка (если был)
+    existing_lines = [
+        l for l in existing_lines
+        if not l.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
+    ]
+
+    # Собираем обратно: header + bridge + остальное
+    with open(TESTED_FILE, "w", encoding="utf-8") as f:
+        for hl in header_lines:
+            f.write(hl + "\n")
+        f.write("\n")
+        f.write(bridge_uri + "\n")
+        for l in existing_lines:
+            f.write(l + "\n")
+
+    log(f"[bridge] ✅ Bridge-конфиг добавлен в начало {TESTED_FILE}")
+
+
+async def do_speed_stage():
+    log("=" * 60)
+    log("  ЭТАП 2: SPEED-ТЕСТ")
+    log("=" * 60)
+
+    if not os.path.exists(WORKING_FILE):
+        log(f"[speed] Файл {WORKING_FILE} не найден, пропускаем")
+        return
+
+    configs = parse_configs_file(WORKING_FILE)
+    if not configs:
+        log("[speed] Нет конфигураций для speed-теста")
+        return
+
+    log(f"[speed] Загружено {len(configs)} уникальных конфигов")
+
+    tester = SpeedTester()
+    t0 = time.time()
+    results = await tester.test_all(configs)
+    elapsed = time.time() - t0
+
+    if results:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(TESTED_FILE, "w", encoding="utf-8") as f:
+            f.write("#profile-title: С высокой скоростью\n")
+            f.write("#profile-update-interval: 1\n")
+            f.write("#support-url: https://t.me/ine4eg\n")
+            f.write("#announce: t.me/ine4eg\n")
+            f.write("#subscription-userinfo: upload=0; download=0; total=0; expire=0\n\n")
+            for r in results:
+                f.write(r + "\n")
+        log(f"[speed] Готово! Найдено {len(results)} быстрых конфигов — {TESTED_FILE}")
+        log(f"[speed] Время: {elapsed:.1f} сек, скорость: {len(configs)/elapsed:.1f} конфигов/сек")
+
+        # ── Найти лучший конфиг и создать bridge ────────────────────
+        best = max(results, key=_extract_download_mbps)
+        await create_bridge(best)
+    else:
+        log("[speed] Не найдено ни одного быстрого конфига")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ОСНОВНОЙ ЦИКЛ
+#  API СЕРВЕР
 # ═══════════════════════════════════════════════════════════════════════════════
 
-START_TIME = time.time()
+from aiohttp import web
 
-
-async def main():
-    global _bridge_manager
-    _bridge_manager = BridgeManager()
-
-    log("=" * 60)
-    log(" VPN Config Runner — BRIDGE mode")
-    log(f" API: http://0.0.0.0:{API_PORT}")
-    log(f" Config URL: {CONFIG_URL}")
-    log("=" * 60)
-
-    # Запуск REST API
-    server = await asyncio.start_server(handle_api_request, "0.0.0.0", API_PORT)
-    log(f"[api] HTTP API запущен на порту {API_PORT}")
-
-    # Основной цикл
-    cycle = 0
-    while True:
-        cycle += 1
-        log(f"\n── Цикл #{cycle} ──")
-
-        working = await vpn_ping_test()
-
-        if working:
-            with open(WORKING_FILE, "w", encoding="utf-8") as f:
-                for u in working:
-                    f.write(u + "\n")
-            log(f"[main] Сохранено {len(working)} рабочих конфигов в {WORKING_FILE}")
-
-            results = await speed_test()
-            good = [r for r in results if _extract_download_mbps(r) >= SPEED_MIN_MBPS]
-
-            if good:
-                await _bridge_manager.start_top3(good)
-                log(f"[main] Bridge работает на SS:{BRIDGE_PORT} с top-3 конфигами")
-            else:
-                log("[main] Нет конфигов со скоростью >= 5 Mbps — bridge не запущен")
+async def handle_working_configs(request):
+    try:
+        if os.path.exists(WORKING_FILE):
+            with open(WORKING_FILE, "r", encoding="utf-8") as f:
+                content = f.read()
+            return web.Response(
+                text=content,
+                content_type="text/plain",
+                charset="utf-8"
+            )
         else:
-            log("[main] Нет рабочих конфигов")
+            return web.Response(text="Нет доступных конфигов", status=404)
+    except Exception as e:
+        return web.Response(text=str(e), status=500)
 
-        log(f"[main] Жду {RUN_INTERVAL}с до следующего цикла...")
+
+async def handle_tested_configs(request):
+    try:
+        if os.path.exists(TESTED_FILE):
+            with open(TESTED_FILE, "r", encoding="utf-8") as f:
+                content = f.read()
+            return web.Response(
+                text=content,
+                content_type="text/plain",
+                charset="utf-8"
+            )
+        else:
+            return web.Response(text="Нет доступных конфигов", status=404)
+    except Exception as e:
+        return web.Response(text=str(e), status=500)
+
+
+async def start_api_server():
+    """Запуск HTTP API сервера"""
+    app = web.Application()
+    app.router.add_get("/working_configs", handle_working_configs)
+    app.router.add_get("/tested_configs", handle_tested_configs)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        API_PORT
+        # Убираем ssl_context - Cloudflare Tunnel сам предоставляет HTTPS
+    )
+    await site.start()
+    log(f"[API] Сервер запущен на http://0.0.0.0:{API_PORT}")
+    log(f"[API] Доступные эндпоинты: GET /working_configs, GET /tested_configs")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ПЛАНИРОВЩИК
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def run_cycle():
+    """Один полный цикл: ping → speed."""
+    log("▶▶▶ Запуск цикла")
+    cycle_start = time.time()
+
+    working_count = await do_ping_stage()
+
+    if working_count > 0:
+        await do_speed_stage()
+    else:
+        log("[!] Ping-тест не дал рабочих конфигов, speed-тест пропускается")
+
+    elapsed = time.time() - cycle_start
+    log(f"◀◀◀ Цикл завершён за {elapsed:.0f} сек.")
+
+
+async def scheduler():
+    log(f"Планировщик запущен. Интервал: {RUN_INTERVAL} сек ({RUN_INTERVAL//60} мин)")
+    log(f"Output dir: {OUTPUT_DIR}")
+    log(f"xray bin  : {XRAY_BIN}")
+
+    while True:
+        await run_cycle()
+        next_run = time.time() + RUN_INTERVAL
+        log(f"Следующий запуск: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_run))}")
         await asyncio.sleep(RUN_INTERVAL)
 
 
+async def main():
+    """Запуск API сервера и планировщика параллельно"""
+    await asyncio.gather(
+        start_api_server(),
+        scheduler()
+    )
+
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("\n[main] Остановлено")
-        if _bridge_manager:
-            asyncio.run(_bridge_manager._stop_all())
-        sys.exit(0)
+    asyncio.run(main())
