@@ -659,20 +659,9 @@ def _ss_xray(uri, socks_port):
     if not m:
         return None
     encoded = m.group(1)
-    # URL-decode first (may contain %XX encoded chars including base64 padding)
-    encoded = urllib.parse.unquote(encoded)
-    # Convert URL-safe base64 to standard base64
-    encoded = encoded.replace("-", "+").replace("_", "/")
-    # Add base64 padding if missing
-    pad = len(encoded) % 4
-    if pad:
-        encoded += "=" * (4 - pad)
-    try:
-        creds = base64.b64decode(encoded).decode("utf-8")
-    except Exception:
-        return None
-    if ":" not in creds:
-        return None
+    if "=" in encoded:
+        encoded = encoded.split("=", 1)[1]
+    creds = base64.b64decode(encoded).decode("utf-8")
     method, password = creds.split(":", 1)
     host, port = m.group(2), int(m.group(3))
 
