@@ -518,8 +518,36 @@ async def run_ping_test(configs):
     return results
 
 
-def get_country_by_ip(host, db_path='/usr/share/GeoIP/GeoLite2-Country.mmdb'):
-    """Получить флаг страны по IP/домену из локальной базы GeoIP"""
+def get_country_via_curl(socks_port, timeout=5):
+    """Получить код страны через curl + ipinfo.io по SOCKS5 прокси"""
+    try:
+        import subprocess
+        result = subprocess.run(
+            [
+                "curl", "--socks5", f"127.0.0.1:{socks_port}",
+                "--max-time", str(timeout), "-s",
+                "https://ipinfo.io/json"
+            ],
+            capture_output=True, text=True, timeout=timeout + 5
+        )
+        if result.returncode == 0 and result.stdout:
+            import json
+            data = json.loads(result.stdout)
+            return data.get("country", "")
+    except Exception:
+        pass
+    return ""
+
+
+def get_country_by_ip(host, socks_port=None):
+    """Получить флаг страны по IP через curl+ipinfo.io (если socks_port) или GeoIP fallback"""
+    # Пытаемся через curl с прокси
+    if socks_port:
+        country_code = get_country_via_curl(socks_port)
+        if country_code:
+            return get_flag(country_code)
+    
+    # Fallback — GeoIP (для backward compatibility)
     try:
         import geoip2.database
         import socket
@@ -527,7 +555,6 @@ def get_country_by_ip(host, db_path='/usr/share/GeoIP/GeoLite2-Country.mmdb'):
         return "🌍"
     
     try:
-        # Извлекаем хост из URI
         h = host
         if '://' in h:
             h = h.split('://')[1]
@@ -535,10 +562,9 @@ def get_country_by_ip(host, db_path='/usr/share/GeoIP/GeoLite2-Country.mmdb'):
             h = h.split('@')[1]
         h = h.split(':')[0].split('?')[0]
         
-        # Разрешаем домен в IP
         ip = socket.gethostbyname(h)
         
-        # Определяем страну по базе
+        db_path = '/usr/share/GeoIP/GeoLite2-Country.mmdb'
         with geoip2.database.Reader(db_path) as reader:
             response = reader.country(ip)
             return get_flag(response.country.iso_code)
