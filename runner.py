@@ -787,15 +787,17 @@ class SpeedTester:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BRIDGE — self-hosted Shadowsocks → лучший конфиг
+#  BRIDGE — self-hosted Shadowsocks → ТРЕМ лучшим конфигам с health-check
 # ═══════════════════════════════════════════════════════════════════════════════
 import hashlib
 
 SS_METHOD    = "chacha20-ietf-poly1305"
 SS_PASSWORD  = hashlib.md5(b"self-hosted-ru-bridge").hexdigest()  # deterministic 32-char
 
-# Храним PIDs bridge-процессов для перезапуска при новом цикле
-_bridge_procs = []
+BRIDGE_POOL_SIZE      = 3
+HEALTH_CHECK_INTERVAL = 5  # секунд
+BRIDGE_SOCKS_PORTS    = [BRIDGE_SOCKS_PORT, BRIDGE_SOCKS_PORT + 1, BRIDGE_SOCKS_PORT + 2]
+
 
 def _extract_download_mbps(uri):
     """Извлечь download Mbps из лейбла URI (после #)"""
@@ -813,59 +815,125 @@ def _extract_download_mbps(uri):
     except Exception:
         return 0
 
-def find_best_config():
-    """Найти конфиг с максимальной download-скоростью из tested_configs.txt"""
+def _get_bridge_prefix():
+    """Получить префикс bridge URI для фильтрации"""
+    return f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@"
+
+
+def _is_non_ru_config(uri):
+    """Проверить, что выходной IP конфига НЕ из РФ через GeoIP."""
+    try:
+        import geoip2.database
+        import socket
+        
+        host = uri
+        if '://' in host:
+            host = host.split('://')[1]
+        if '@' in host:
+            host = host.split('@')[1]
+        host = host.split(':')[0].split('?')[0]
+        
+        ip = socket.gethostbyname(host)
+        
+        db_path = '/usr/share/GeoIP/GeoLite2-Country.mmdb'
+        with geoip2.database.Reader(db_path) as reader:
+            response = reader.country(ip)
+            return response.country.iso_code != 'RU'
+    except Exception:
+        pass
+    # Если не определили — исключаем из bridge (better safe than sorry)
+    return False
+
+
+def _get_all_real_configs():
+    """Получить все реальные конфиги (не bridge, не RU) из tested_configs.txt"""
     if not os.path.exists(TESTED_FILE):
-        return None
+        return []
     configs = parse_configs_file(TESTED_FILE)
-    if not configs:
-        return None
-    # Исключаем bridge URI и конфиги со скоростью 0
-    real_configs = [
-        c for c in configs
-        if not c.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
-        and _extract_download_mbps(c) > 0
-    ]
-    if not real_configs:
-        return None
-    return max(real_configs, key=_extract_download_mbps)
+    prefix = _get_bridge_prefix()
+    real = [c for c in configs if not c.startswith(prefix) and _extract_download_mbps(c) > 0]
+    # Фильтруем — только НЕ-РФ по GeoIP
+    non_ru = [c for c in real if _is_non_ru_config(c)]
+    if len(non_ru) < len(real):
+        log(f"[bridge] GeoIP: {len(real)} рабочих → {len(non_ru)} без РФ")
+    return non_ru
 
-def _build_best_outbound_uri(best_uri, socks_port):
-    """
-    Берём URI лучшего конфига и возвращаем его «нативный» outbound-конфиг
-    (host + port) для SOCKS-переадресации.
-    """
-    # Парсим хост:порт из best_uri
-    m = re.match(r"(?:vless|vmess|trojan|ss)://[^@]+@([^:]+):(\d+)", best_uri)
-    if not m:
-        return None, None
-    return m.group(1), int(m.group(2))
 
-def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
-    """
-    Создаём xray-конфиг:
-      inbound  → Shadowsocks на 0.0.0.0:bridge_inbound_port
-      outbound → SOCKS через upstream_socks_port (лучший конфиг)
-    """
-    host, port = _build_best_outbound_uri(best_uri, upstream_socks_port)
-    if not host:
-        return None
+# ─── Глобальное состояние bridge-менеджера ─────────────────────────────
+_bridge_state = {
+    'upstream_procs': [None, None, None],
+    'upstream_uris':  [None, None, None],
+    'bridge_proc':    None,
+    'active_idx':     0,
+    'running':        False,
+    'health_task':    None,
+}
 
-    return {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "port": bridge_inbound_port,
-            "listen": "0.0.0.0",
-            "protocol": "shadowsocks",
-            "settings": {
-                "method": SS_METHOD,
-                "password": SS_PASSWORD,
-                "udp": True,
-                "network": "tcp,udp"
-            }
-        }],
-        "outbounds": [
-            {
+
+class BridgeManager:
+    """Управляет ТРЕМЯ upstream-процессами с health-check и failover."""
+
+    def _select_pool(self, top3):
+        """Собрать пул из 3-х лучших конфигов, заполнив пустые слоты."""
+        pool = [None, None, None]
+        for i, uri in enumerate(top3[:3]):
+            pool[i] = uri
+
+        # Заполняем пустые слоты из доступных
+        tested = _get_all_real_configs()
+        used   = {u for u in pool if u is not None}
+        available = [c for c in tested if c not in used]
+
+        while None in pool and available:
+            pos = pool.index(None)
+            pool[pos] = available.pop(0)
+
+        return pool
+
+    async def _stop_process(self, proc):
+        """Безопасно остановить процесс."""
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    async def _start_upstream(self, uri, port_idx):
+        """Запустить один upstream xray на指定 SOCKS-порту."""
+        socks_port = BRIDGE_SOCKS_PORTS[port_idx]
+        cfg = make_xray_config(uri, socks_port)
+        if not cfg:
+            return None
+        proc = await start_xray(cfg, socks_port)
+        if proc:
+            log(f"[bridge]   Upstream [{port_idx}] запущен (SOCKS :{socks_port})")
+        return proc
+
+    async def _restart_bridge(self, active_idx):
+        """Перезапустить bridge xray с маршрутизацией на активный upstream."""
+        if self._bridge_state['bridge_proc']:
+            await self._stop_process(self._bridge_state['bridge_proc'])
+
+        upstream_socks_port = BRIDGE_SOCKS_PORTS[active_idx]
+
+        bridge_cfg = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "port": BRIDGE_PORT,
+                "listen": "0.0.0.0",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "method": SS_METHOD,
+                    "password": SS_PASSWORD,
+                    "udp": True,
+                    "network": "tcp,udp"
+                }
+            }],
+            "outbounds": [{
                 "tag": "proxy",
                 "protocol": "socks",
                 "settings": {
@@ -874,106 +942,185 @@ def _build_bridge_xray(best_uri, bridge_inbound_port, upstream_socks_port):
                         "port": upstream_socks_port
                     }]
                 }
-            }
-        ]
-        # routing убран — весь трафик идёт в proxy (upstream socks)
-    }
+            }]
+        }
 
-def _build_upstream_xray(best_uri, socks_port):
-    """Создаём xray-конфиг лучшего конфига с SOCKS на socks_port."""
-    return make_xray_config(best_uri, socks_port)
+        proc = await start_xray(bridge_cfg, BRIDGE_PORT)
+        if proc:
+            self._bridge_state['bridge_proc'] = proc
+            log(f"[bridge]   Bridge → Shadowsocks :{BRIDGE_PORT} → SOCKS :{upstream_socks_port}")
+        return proc
+
+    async def _switch_to(self, new_idx):
+        """Переключить активный upstream на new_idx."""
+        if self._bridge_state['upstream_uris'][new_idx] is None:
+            return False
+        log(f"[bridge] ⚡ Переключение на upstream [{new_idx}]: {get_label(self._bridge_state['upstream_uris'][new_idx])[:50]}")
+        self._bridge_state['active_idx'] = new_idx
+        await self._restart_bridge(new_idx)
+        return True
+
+    async def _replenish_slot(self, slot_idx):
+        """Пополнить слот новым рабочим конфигом."""
+        tested = _get_all_real_configs()
+        used   = set(self._bridge_state['upstream_uris']) - {None}
+        available = [c for c in tested if c not in used]
+
+        if not available:
+            log("[bridge] Нет доступных конфигов для пополнения")
+            return False
+
+        # Берём лучший доступный
+        new_uri = max(available, key=_extract_download_mbps)
+
+        await self._stop_process(self._bridge_state['upstream_procs'][slot_idx])
+        proc = await self._start_upstream(new_uri, slot_idx)
+        if proc:
+            self._bridge_state['upstream_procs'][slot_idx] = proc
+            self._bridge_state['upstream_uris'][slot_idx]  = new_uri
+            log(f"[bridge]   🔄 Слот [{slot_idx}] пополнен: {get_label(new_uri)[:50]}")
+            return True
+        return False
+
+    async def health_check_loop(self):
+        """Health-check каждые HEALTH_CHECK_INTERVAL секунд."""
+        while self._bridge_state['running']:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+            active = self._bridge_state['active_idx']
+            proc   = self._bridge_state['upstream_procs'][active]
+
+            # Проверяем активный upstream
+            if proc is None or proc.poll() is not None:
+                log(f"[bridge] ⚠️ Active upstream [{active}] упал!")
+
+                # Ищем живой backup
+                switched = False
+                for i in range(BRIDGE_POOL_SIZE):
+                    if i == active:
+                        continue
+                    up = self._bridge_state['upstream_procs'][i]
+                    if self._bridge_state['upstream_uris'][i] and up and up.poll() is None:
+                        await self._switch_to(i)
+                        switched = True
+                        break
+
+                # Восстанавливаем упавший слот
+                await self._replenish_slot(active)
+
+                # Если не переключились, пробуем после восстановления
+                if not switched:
+                    for i in range(BRIDGE_POOL_SIZE):
+                        up = self._bridge_state['upstream_procs'][i]
+                        if self._bridge_state['upstream_uris'][i] and up and up.poll() is None:
+                            await self._switch_to(i)
+                            switched = True
+                            break
+
+                if not switched:
+                    log("[bridge] ❌ Нет доступных upstream-процессов!")
+
+            # Проверяем backup-слоты — восстанавливаем упавшие
+            for i in range(BRIDGE_POOL_SIZE):
+                if i == self._bridge_state['active_idx']:
+                    continue
+                up = self._bridge_state['upstream_procs'][i]
+                if self._bridge_state['upstream_uris'][i] and up and up.poll() is not None:
+                    log(f"[bridge] ⚠️ Backup upstream [{i}] упал, пополняю...")
+                    await self._replenish_slot(i)
+
+    def _save_bridge_uri(self, bridge_uri):
+        """Сохранить bridge URI в начало tested_configs.txt."""
+        prefix = _get_bridge_prefix()
+        existing_lines = []
+        header_lines = []
+        if os.path.exists(TESTED_FILE):
+            with open(TESTED_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#"):
+                        header_lines.append(line)
+                    elif line:
+                        existing_lines.append(line)
+
+        existing_lines = [l for l in existing_lines if not l.startswith(prefix)]
+
+        with open(TESTED_FILE, "w", encoding="utf-8") as f:
+            for hl in header_lines:
+                f.write(hl + "\n")
+            f.write("\n")
+            f.write(bridge_uri + "\n")
+            for l in existing_lines:
+                f.write(l + "\n")
+
+        log(f"[bridge] ✅ Bridge-конфиг добавлен в {TESTED_FILE}")
+
+    async def start(self, top3_uris):
+        """Запустить bridge с ТРЕМЯ лучшими конфигами."""
+        if not top3_uris:
+            log("[bridge] Нет URI для bridge")
+            return
+
+        self._bridge_state['running'] = True
+
+        log("=" * 60)
+        log("  BRIDGE: self-hosted Shadowsocks мост (3 upstream + health-check)")
+        log("=" * 60)
+
+        # Остановить старые процессы
+        for proc in self._bridge_state['upstream_procs']:
+            await self._stop_process(proc)
+        await self._stop_process(self._bridge_state['bridge_proc'])
+
+        self._bridge_state['upstream_procs'] = [None, None, None]
+        self._bridge_state['upstream_uris']  = [None, None, None]
+        self._bridge_state['bridge_proc']    = None
+
+        # Собрать пул из 3-х
+        pool = self._select_pool(top3_uris)
+        self._bridge_state['upstream_uris'] = pool
+
+        # Запустить все 3 upstream
+        for i in range(BRIDGE_POOL_SIZE):
+            if pool[i]:
+                dl = _extract_download_mbps(pool[i])
+                log(f"[bridge]   [{i}] ↓{dl} Mbps — {get_label(pool[i])[:50]}")
+                proc = await self._start_upstream(pool[i], i)
+                self._bridge_state['upstream_procs'][i] = proc
+
+        # Активный = слот 0 (лучший)
+        self._bridge_state['active_idx'] = 0
+        await self._restart_bridge(0)
+
+        # Сгенерировать и сохранить bridge URI
+        bridge_label = "self-hosted RU 🇷🇺"
+        userinfo = base64.b64encode(f"{SS_METHOD}:{SS_PASSWORD}".encode()).decode()
+        bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_PORT}#{urllib.parse.quote(bridge_label)}"
+        log(f"[bridge] URI: {bridge_uri}")
+        self._save_bridge_uri(bridge_uri)
+
+        # Запустить health-check задачу
+        if self._bridge_state['health_task']:
+            self._bridge_state['health_task'].cancel()
+        self._bridge_state['health_task'] = asyncio.create_task(self.health_check_loop())
+
+        log(f"[bridge] ✅ Bridge запущен с {BRIDGE_POOL_SIZE} upstream, health-check каждые {HEALTH_CHECK_INTERVAL}с")
 
 
-async def create_bridge(best_uri):
+# Глобальный менеджер
+_bridge_manager = BridgeManager()
+
+
+async def create_bridge(top3_uris):
     """
-    Создаёт мост:
-      1. Запускаем лучший конфиг (best_uri) на SOCKS порту (BRIDGE_SOCKS_PORT)
-      2. Запускаем bridge xray (VLESS без TLS → SOCKS лучшего)
-      3. Добавляем bridge URI в начало tested_configs.txt
+    Создаёт мост с ТРЕМЯ лучшими конфигами:
+      1. Запускает 3 upstream xray (по одному на конфиг)
+      2. Запускает bridge xray (Shadowsocks → активный upstream)
+      3. Health-check каждые 5с, failover при падении активного
+      4. Динамическое пополнение пула при падении любого слота
+      5. Вход: один порт 8443
     """
-    if not best_uri:
-        log("[bridge] best_uri не передан, пропускаем")
-        return
-
-    log("=" * 60)
-    log("  BRIDGE: Создание self-hosted Shadowsocks моста")
-    log("=" * 60)
-
-    dl = _extract_download_mbps(best_uri)
-    log(f"[bridge] Лучший конфиг: ↓{dl} Mbps — {get_label(best_uri)[:50]}")
-
-    # ── Остановить старые bridge-процессы ─────────────────────────────
-    for proc in _bridge_procs:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    _bridge_procs.clear()
-
-    # ── Запустить лучший конфиг как SOCKS ─────────────────────────────
-    upstream_cfg = _build_upstream_xray(best_uri, BRIDGE_SOCKS_PORT)
-    if not upstream_cfg:
-        log("[bridge] Не удалось создать конфиг лучшего, пропускаем")
-        return
-
-    upstream_proc = await start_xray(upstream_cfg, BRIDGE_SOCKS_PORT)
-    if not upstream_proc:
-        log("[bridge] Не удалось запустить xray лучшего конфига")
-        return
-    _bridge_procs.append(upstream_proc)
-    log(f"[bridge] Upstream xray запущен (SOCKS :{BRIDGE_SOCKS_PORT})")
-
-    # ── Запустить bridge Shadowsocks ───────────────────────────────────
-    bridge_cfg = _build_bridge_xray(best_uri, BRIDGE_PORT, BRIDGE_SOCKS_PORT)
-    if not bridge_cfg:
-        log("[bridge] Не удалось создать bridge-конфиг")
-        return
-
-    bridge_proc = await start_xray(bridge_cfg, BRIDGE_PORT)
-    if not bridge_proc:
-        log("[bridge] Не удалось запустить bridge xray")
-        return
-    _bridge_procs.append(bridge_proc)
-    log(f"[bridge] Bridge xray запущен (Shadowsocks :{BRIDGE_PORT})")
-
-    # ── Сгенерировать bridge URI ──────────────────────────────────────
-    bridge_label = "self-hosted RU 🇷🇺"
-    userinfo = base64.b64encode(f"{SS_METHOD}:{SS_PASSWORD}".encode()).decode()
-    bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_PORT}#{urllib.parse.quote(bridge_label)}"
-    log(f"[bridge] URI: {bridge_uri}")
-
-    # ── Добавить в начало tested_configs.txt ──────────────────────────
-    existing_lines = []
-    header_lines = []
-    if os.path.exists(TESTED_FILE):
-        with open(TESTED_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("#"):
-                    header_lines.append(line)
-                elif line:
-                    existing_lines.append(line)
-
-    # Удаляем старый bridge URI из списка (если был)
-    existing_lines = [
-        l for l in existing_lines
-        if not l.startswith(f"ss://{base64.b64encode(f'{SS_METHOD}:{SS_PASSWORD}'.encode()).decode()}@")
-    ]
-
-    # Собираем обратно: header + bridge + остальное
-    with open(TESTED_FILE, "w", encoding="utf-8") as f:
-        for hl in header_lines:
-            f.write(hl + "\n")
-        f.write("\n")
-        f.write(bridge_uri + "\n")
-        for l in existing_lines:
-            f.write(l + "\n")
-
-    log(f"[bridge] ✅ Bridge-конфиг добавлен в начало {TESTED_FILE}")
+    await _bridge_manager.start(top3_uris)
 
 
 async def do_speed_stage():
@@ -1010,9 +1157,9 @@ async def do_speed_stage():
         log(f"[speed] Готово! Найдено {len(results)} быстрых конфигов — {TESTED_FILE}")
         log(f"[speed] Время: {elapsed:.1f} сек, скорость: {len(configs)/elapsed:.1f} конфигов/сек")
 
-        # ── Найти лучший конфиг и создать bridge ────────────────────
-        best = max(results, key=_extract_download_mbps)
-        await create_bridge(best)
+        # ── Найти ТРЕХ лучших конфигов и создать bridge с failover ──
+        top3 = sorted(results, key=_extract_download_mbps, reverse=True)[:3]
+        await create_bridge(top3)
     else:
         log("[speed] Не найдено ни одного быстрого конфига")
 
