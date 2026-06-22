@@ -658,7 +658,10 @@ def _ss_xray(uri, socks_port):
     m = re.match(r"ss://([^@]+)@([^:]+):(\d+)", uri)
     if not m:
         return None
-    creds = base64.b64decode(m.group(1).split("=", 1)[1]).decode("utf-8")
+    encoded = m.group(1)
+    if "=" in encoded:
+        encoded = encoded.split("=", 1)[1]
+    creds = base64.b64decode(encoded).decode("utf-8")
     method, password = creds.split(":", 1)
     host, port = m.group(2), int(m.group(3))
 
