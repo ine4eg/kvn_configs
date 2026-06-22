@@ -873,6 +873,16 @@ _bridge_state = {
 class BridgeManager:
     """Управляет ТРЕМЯ upstream-процессами с health-check и failover."""
 
+    def __init__(self):
+        self._bridge_state = {
+            'running': False,
+            'upstream_procs': [None, None, None],
+            'upstream_uris': [None, None, None],
+            'active_idx': 0,
+            'bridge_proc': None,
+            'health_task': None,
+        }
+
     def _select_pool(self, top3):
         """Собрать пул из 3-х лучших конфигов, заполнив пустые слоты."""
         pool = [None, None, None]
