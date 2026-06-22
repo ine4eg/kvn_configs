@@ -806,13 +806,40 @@ async def vpn_ping_test():
             cleaned.append(u)
     log(f"[ping] Уникальных после очистки: {len(cleaned)}")
 
-    tasks = [ping_one(u) for u in cleaned]
-    results = []
+    total = len(cleaned)
+    tested = 0
+    working_count = 0
+    failed_count = 0
+    best_results = []  # (ms, label) для лучших результатов
+    lock = asyncio.Lock()
     sem = asyncio.Semaphore(PING_MAX_WORKERS)
+    last_log_time = 0
 
     async def limited(uri):
+        nonlocal tested, working_count, failed_count, last_log_time
         async with sem:
-            return await ping_one(uri)
+            ms, _ = await ping_one(uri)
+        async with lock:
+            tested += 1
+            label = get_label(uri)[:40]
+            proto = protocol_name(uri)
+            now = time.time()
+            if ms is not None:
+                working_count += 1
+                best_results.append((ms, label, proto))
+                # Логируем каждый рабочий + периодический прогресс
+                if ms < 300 or (tested % 25 == 0) or tested == total or (now - last_log_time) > 2:
+                    best_results.sort(key=lambda x: x[0])
+                    top3 = best_results[:3]
+                    top_str = "; ".join(f"{ms:.0f}ms {lbl}" for ms, lbl, _ in top3)
+                    log(f"[ping] {working_count}/{tested} ✅ {ms:.0f}ms {proto} {label}  |  TOP3: {top_str}")
+                    last_log_time = now
+            else:
+                failed_count += 1
+                if (tested % 25 == 0) or tested == total or (now - last_log_time) > 2:
+                    log(f"[ping] {working_count}/{tested} ❌ {proto} {label}  |  Нерабочих: {failed_count}")
+                    last_log_time = now
+        return ms, uri
 
     coros = [limited(u) for u in cleaned]
     results = await asyncio.gather(*coros)
@@ -824,7 +851,18 @@ async def vpn_ping_test():
 
     working.sort(key=lambda u: _extract_download_mbps(u) if _extract_download_mbps(u) > 0 else float('inf'))
 
-    log(f"[ping] Рабочих: {len(working)}/{len(cleaned)}")
+    # Итоговая сводка пинг-теста
+    log(f"\n{'═'*70}")
+    log(f"[ping] 📊 ИТОГИ ПИНГ-ТЕСТА")
+    log(f"  Всего тестировано: {total}")
+    log(f"  Рабочих: {working_count}  |  Нерабочих: {failed_count}")
+    if best_results:
+        best_results.sort(key=lambda x: x[0])
+        log(f"  🏆 Лучшие по пингу:")
+        for i, (ms, label, proto) in enumerate(best_results[:10], 1):
+            medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f" {i}."
+            log(f"    {medal} {ms:.0f}ms  {proto}  {label}")
+    log(f"{'═'*70}\n")
     return working
 
 
@@ -906,27 +944,65 @@ async def speed_test():
     with open(WORKING_FILE, "r", encoding="utf-8") as f:
         uris = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-    log(f"[speed] Тестирование {len(uris)} конфилов...")
+    total = len(uris)
+    log(f"[speed] Тестирование скорости {total} конфигов...")
 
-    sem = asyncio.Semaphore(SPEED_MAX_WORKERS)
+    tested = 0
+    failed_count = 0
     results = []
+    best_speeds = []  # (dl_mbps, result_line)
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(SPEED_MAX_WORKERS)
+    last_log_time = 0
 
     async def limited(uri):
+        nonlocal tested, failed_count, last_log_time
         async with sem:
-            return await speed_one(uri)
+            r = await speed_one(uri)
+        async with lock:
+            tested += 1
+            now = time.time()
+            if r is not None:
+                dl = _extract_download_mbps(r)
+                results.append(r)
+                label = get_label(r)[:50]
+                best_speeds.append((dl, r))
+                best_speeds.sort(key=lambda x: x[0], reverse=True)
+                top3 = best_speeds[:3]
+                top_str = "; ".join(f"↓{dl:.0f}Mbps {get_label(l)[:30]}" for dl, l in top3)
+                if dl >= SPEED_MIN_MBPS or (tested % 15 == 0) or tested == total or (now - last_log_time) > 3:
+                    log(f"[speed] {tested}/{total} ↓{dl:.0f}Mbps {label}  |  TOP3: {top_str}")
+                    last_log_time = now
+            else:
+                failed_count += 1
+                if (tested % 15 == 0) or tested == total or (now - last_log_time) > 3:
+                    log(f"[speed] {tested}/{total} ... (нерабочих: {failed_count})")
+                    last_log_time = now
+        return r
 
     coros = [limited(u) for u in uris]
-    raw_results = await asyncio.gather(*coros)
-
-    for r in raw_results:
-        if r is not None:
-            results.append(r)
+    await asyncio.gather(*coros)
 
     good = [r for r in results if _extract_download_mbps(r) >= SPEED_MIN_MBPS]
     good.sort(key=lambda r: _extract_download_mbps(r), reverse=True)
 
-    log(f"[speed] Скорость ≥{SPEED_MIN_MBPS} Mbps: {len(good)}/{len(results)}")
-    log(f"[speed] Всего протестировано: {len(results)}/{len(uris)}")
+    # Итоговая сводка спид-теста
+    log(f"\n{'═'*70}")
+    log(f"[speed] 📊 ИТОГИ СПИД-ТЕСТА")
+    log(f"  Всего тестировано: {total}")
+    log(f"  Получено результатов: {len(results)}  |  Ошибок: {failed_count}")
+    log(f"  Прошли порог ≥{SPEED_MIN_MBPS}Mbps: {len(good)}")
+    if best_speeds:
+        best_speeds.sort(key=lambda x: x[0], reverse=True)
+        log(f"  🏆 Лучшие по скорости:")
+        for i, (dl, line) in enumerate(best_speeds[:10], 1):
+            medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f" {i}."
+            label = get_label(line)[:60]
+            # Извлечь upload из строки
+            ul_match = re.search(r"↑(\d+)", line)
+            ul = int(ul_match.group(1)) if ul_match else 0
+            log(f"    {medal} ↓{dl:.0f} / ↑{ul:.0f} Mbps  {label}")
+    log(f"{'═'*70}\n")
 
     if results:
         with open(TESTED_FILE, "w", encoding="utf-8") as f:
