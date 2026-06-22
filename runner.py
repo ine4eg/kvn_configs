@@ -998,7 +998,35 @@ class BridgeManager:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
             active = self._bridge_state['active_idx']
-            proc   = self._bridge_state['upstream_procs'][active]
+
+            # ── Логи статуса всех слотов ──────────────────────────────
+            status_lines = []
+            for i in range(BRIDGE_POOL_SIZE):
+                uri  = self._bridge_state['upstream_uris'][i]
+                proc = self._bridge_state['upstream_procs'][i]
+                label_short = get_label(uri)[:40] if uri else "пусто"
+
+                if i == active:
+                    role = "ACTIVE"
+                else:
+                    role = "backup"
+
+                if proc is None:
+                    health = "✗ нет процесса"
+                elif proc.poll() is not None:
+                    health = "✗ упал"
+                else:
+                    health = "✓ жив"
+
+                port = BRIDGE_SOCKS_PORTS[i]
+                status_lines.append(f"  [{i}]({role}) port:{port} {health} | {label_short}")
+
+            log("[bridge] 🩺 Health-Check:")
+            for line in status_lines:
+                log(line)
+            # ── Конец логов статуса ────────────────────────────────────
+
+            proc = self._bridge_state['upstream_procs'][active]
 
             # Проверяем активный upstream
             if proc is None or proc.poll() is not None:
