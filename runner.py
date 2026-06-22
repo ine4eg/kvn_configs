@@ -990,7 +990,27 @@ class BridgeManager:
             self._bridge_state['upstream_uris'][slot_idx]  = new_uri
             log(f"[bridge]   🔄 Слот [{slot_idx}] пополнен: {get_label(new_uri)[:50]}")
             return True
-        return False
+
+    async def _ping_socks(self, port_idx, timeout=3):
+        """Проверить upstream через реальный запрос по SOCKS."""
+        proc = self._bridge_state['upstream_procs'][port_idx]
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            r = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "curl", "-s", "--max-time", str(timeout),
+                    "--socks5-hostname", f"127.0.0.1:{BRIDGE_SOCKS_PORTS[port_idx]}",
+                    "http://cp.cloudflare.com/",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                ),
+                timeout=timeout + 1
+            )
+            await r.communicate()
+            return r.returncode == 0
+        except Exception:
+            return False
 
     async def health_check_loop(self):
         """Health-check каждые HEALTH_CHECK_INTERVAL секунд."""
@@ -998,6 +1018,11 @@ class BridgeManager:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
             active = self._bridge_state['active_idx']
+
+            # ── Проверяем все слоты ping-ом ──────────────────────────
+            slot_health = {}
+            for i in range(BRIDGE_POOL_SIZE):
+                slot_health[i] = await self._ping_socks(i)
 
             # ── Логи статуса всех слотов ──────────────────────────────
             status_lines = []
@@ -1015,8 +1040,10 @@ class BridgeManager:
                     health = "✗ нет процесса"
                 elif proc.poll() is not None:
                     health = "✗ упал"
+                elif slot_health[i]:
+                    health = "✓ жив (ping OK)"
                 else:
-                    health = "✓ жив"
+                    health = "✗ ping FAIL"
 
                 port = BRIDGE_SOCKS_PORTS[i]
                 status_lines.append(f"  [{i}]({role}) port:{port} {health} | {label_short}")
@@ -1026,19 +1053,21 @@ class BridgeManager:
                 log(line)
             # ── Конец логов статуса ────────────────────────────────────
 
-            proc = self._bridge_state['upstream_procs'][active]
+            # ── Проверяем активный upstream ───────────────────────────
+            active_proc = self._bridge_state['upstream_procs'][active]
+            active_dead = (active_proc is None
+                           or active_proc.poll() is not None
+                           or not slot_health.get(active, False))
 
-            # Проверяем активный upstream
-            if proc is None or proc.poll() is not None:
-                log(f"[bridge] ⚠️ Active upstream [{active}] упал!")
+            if active_dead:
+                log(f"[bridge] ⚠️ Active upstream [{active}] не отвечает!")
 
                 # Ищем живой backup
                 switched = False
                 for i in range(BRIDGE_POOL_SIZE):
                     if i == active:
                         continue
-                    up = self._bridge_state['upstream_procs'][i]
-                    if self._bridge_state['upstream_uris'][i] and up and up.poll() is None:
+                    if slot_health.get(i, False):
                         await self._switch_to(i)
                         switched = True
                         break
@@ -1049,8 +1078,7 @@ class BridgeManager:
                 # Если не переключились, пробуем после восстановления
                 if not switched:
                     for i in range(BRIDGE_POOL_SIZE):
-                        up = self._bridge_state['upstream_procs'][i]
-                        if self._bridge_state['upstream_uris'][i] and up and up.poll() is None:
+                        if slot_health.get(i, False):
                             await self._switch_to(i)
                             switched = True
                             break
@@ -1062,10 +1090,10 @@ class BridgeManager:
             for i in range(BRIDGE_POOL_SIZE):
                 if i == self._bridge_state['active_idx']:
                     continue
-                up = self._bridge_state['upstream_procs'][i]
-                if self._bridge_state['upstream_uris'][i] and up and up.poll() is not None:
-                    log(f"[bridge] ⚠️ Backup upstream [{i}] упал, пополняю...")
-                    await self._replenish_slot(i)
+                if self._bridge_state['upstream_uris'][i]:
+                    if not slot_health.get(i, False):
+                        log(f"[bridge] ⚠️ Backup upstream [{i}] не отвечает, пополняю...")
+                        await self._replenish_slot(i)
 
     def _save_bridge_uri(self, bridge_uri):
         """Сохранить bridge URI в начало tested_configs.txt."""
