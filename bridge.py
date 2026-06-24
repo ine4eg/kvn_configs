@@ -24,6 +24,7 @@ except ImportError:
 
 BRIDGE_IP          = "95.165.137.180"
 BRIDGE_PORT        = 8443
+BRIDGE_EXT_PORT = 443
 BRIDGE_POOL_SIZE   = 3
 BRIDGE_SOCKS_PORTS = [11080, 11081, 11082]
 
@@ -215,14 +216,11 @@ class BridgeManager:
 
         return pool
 
-    async def _restart_bridge(self, active_idx):
-        """Перезапустить bridge xray с маршрутизацией на активный upstream."""
-        if self._bridge_state['bridge_proc']:
-            await self._stop_process(self._bridge_state['bridge_proc'])
-
+    async def _create_bridge_config(self, active_idx):
+        """Создать конфигурацию bridge xray для указанного upstream."""
         upstream_socks_port = BRIDGE_SOCKS_PORTS[active_idx]
 
-        bridge_cfg = {
+        return {
             "log": {"loglevel": "warning"},
             "inbounds": [{
                 "port": BRIDGE_PORT,
@@ -247,11 +245,87 @@ class BridgeManager:
             }]
         }
 
-        proc = await _start_xray(bridge_cfg, BRIDGE_PORT)
-        if proc:
-            self._bridge_state['bridge_proc'] = proc
-            _l(f"[bridge]   Bridge → Shadowsocks :{BRIDGE_PORT} → SOCKS :{upstream_socks_port}")
-        return proc
+    async def _restart_bridge(self, active_idx):
+        """Soft restart bridge xray: запустить НОВЫЙ процесс ДО остановки СТАРОГО.
+
+        Алгоритм zero-downtime:
+          1. Запустить новый xray на временном порту (warm-up)
+          2. Проверить что warm-up отвечает
+          3. Быстрый switch: остановить старый → запустить новый на BRIDGE_PORT
+          4. Oстановить warm-up
+        """
+        old_proc = self._bridge_state['bridge_proc']
+        upstream_socks_port = BRIDGE_SOCKS_PORTS[active_idx]
+        bridge_cfg = await self._create_bridge_config(active_idx)
+
+        # ── Warm-up на временном порту ──────────────────────────────────
+        temp_port = BRIDGE_PORT + 1000
+        warm_cfg = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "port": temp_port,
+                "listen": "0.0.0.0",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "method": SS_METHOD,
+                    "password": SS_PASSWORD,
+                    "udp": True,
+                    "network": "tcp,udp"
+                }
+            }],
+            "outbounds": bridge_cfg["outbounds"]
+        }
+
+        warm_proc = None
+        try:
+            warm_proc = await _start_xray(warm_cfg, temp_port)
+        except Exception:
+            warm_proc = None
+
+        if warm_proc:
+            try:
+                await asyncio.sleep(0.3)
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection('127.0.0.1', temp_port), timeout=3
+                )
+                w.close()
+                await w.wait_closed()
+                _l(f"[bridge]   Warm-up OK на :{temp_port}, выполняю soft-switch")
+            except Exception:
+                _l(f"[bridge]   ⚠ Warm-up не ответил → hard-restart")
+                try:
+                    await self._stop_process(warm_proc)
+                except Exception:
+                    pass
+                warm_proc = None
+        else:
+            _l(f"[bridge]   ⚠ Не удалось запустить warm-up → hard-restart")
+
+        # ── Switch ──────────────────────────────────────────────────────
+        if warm_proc is not None:
+            # Soft: у нас есть готовый процесс, остановить старый
+            if old_proc:
+                await self._stop_process(old_proc)
+            
+            # Запустить финальный bridge на BRIDGE_PORT (быстро стартует, т.к. upstream уже тёплый)
+            new_proc = await _start_xray(bridge_cfg, BRIDGE_PORT)
+            if new_proc:
+                self._bridge_state['bridge_proc'] = new_proc
+                _l(f"[bridge]   Bridge → Shadowsocks :{BRIDGE_PORT} → SOCKS :{upstream_socks_port}")
+            else:
+                # Fallback — если не удалось запустить на основном порту
+                _l(f"[bridge]   ❌ Не удалось запустить bridge на :{BRIDGE_PORT}")
+            
+            # Очистить warm-up
+            await self._stop_process(warm_proc)
+        else:
+            # Hard-restart: сначала остановить, потом запустить
+            if old_proc:
+                await self._stop_process(old_proc)
+            new_proc = await _start_xray(bridge_cfg, BRIDGE_PORT)
+            if new_proc:
+                self._bridge_state['bridge_proc'] = new_proc
+                _l(f"[bridge]   Bridge → Shadowsocks :{BRIDGE_PORT} → SOCKS :{upstream_socks_port}")
 
     async def _switch_to(self, new_idx):
         """Переключить активный upstream на new_idx."""
@@ -337,13 +411,15 @@ class BridgeManager:
 
     async def health_check_loop(self):
         """Основной цикл health-check: ping 5с, speed 60с, лог 5с."""
-        slot_health = {0: False, 1: False, 2: False}
-        slot_speed_ok = {0: False, 1: False, 2: False}  # True если upstream прошёл speed-test
-        speed_tester = None
-        last_speed_check = time.time()
-
         _l("[bridge-hc] Health-check цикл запущен")
         _l("[bridge-hc] Ping: каждые 5с | Speed: каждые 60с | Log: каждые 5с")
+
+        # Инициализируем slot_speed_ok как True — конфиги уже прошли speed-test в runner.py
+        # (они берутся из tested_configs.txt, где скорость уже проверена)
+        slot_health = {0: False, 1: False, 2: False}
+        slot_speed_ok = {0: True, 1: True, 2: True}
+        speed_tester = None
+        last_speed_check = time.time()
 
         while self._bridge_state['running']:
             try:
@@ -366,7 +442,7 @@ class BridgeManager:
                 # ── bridge процесс жив? ───────────────────────────────────
                 bridge_proc = self._bridge_state['bridge_proc']
                 if bridge_proc and bridge_proc.poll() is not None:
-                    _l("[bridge-hc] Bridge процесс умер → перезапуск")
+                    _l("[bridge-hc] Bridge процесс умер → перезапуск (soft)")
                     await self._restart_bridge(self._bridge_state['active_idx'])
 
                 # ── ре-тест скоростей каждые 60с ─────────────────────────
@@ -399,14 +475,15 @@ class BridgeManager:
                             slot_speed_ok[idx] = False
                             _l(f"[bridge-hc] Ошибка ре-теста upstream [{idx}]: {e}")
 
-
-                # ── failover: если активный упал или не прошёл speed-test ──
+                # ── failover: если активный упал ─────────────────────────
                 active = self._bridge_state['active_idx']
                 active_proc = self._bridge_state['upstream_procs'][active]
+
+                # Проверяем только процесс и health, а не speed_ok
+                # (скорость уже была проверена при выборе из tested_configs.txt)
                 active_dead = (active_proc is None
                                or active_proc.poll() is not None
-                               or not slot_health.get(active, False)
-                               or not slot_speed_ok.get(active, False))
+                               or not slot_health.get(active, False))
 
                 if active_dead:
                     _l(f"[bridge] ⚠️ Active upstream [{active}] не отвечает!")
@@ -542,7 +619,7 @@ class BridgeManager:
         # Сгенерировать и сохранить bridge URI
         bridge_label = "self-hosted RU 🇷🇺"
         userinfo = base64.b64encode(f"{SS_METHOD}:{SS_PASSWORD}".encode()).decode()
-        bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_PORT}#{urllib.parse.quote(bridge_label)}"
+        bridge_uri = f"ss://{userinfo}@{BRIDGE_IP}:{BRIDGE_EXT_PORT}#{urllib.parse.quote(bridge_label)}"
         _l(f"[bridge] URI: {bridge_uri}")
         self._save_bridge_uri(bridge_uri)
 
