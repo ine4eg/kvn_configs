@@ -7,10 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Настройка DNS
-RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf && \
-    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-
 # Устанавливаем xray
 ARG XRAY_VERSION=26.3.27
 ARG TARGETARCH=amd64
@@ -18,7 +14,8 @@ RUN ARCH=${TARGETARCH} && \
     if [ "$ARCH" = "amd64" ]; then XARCH="64"; \
     elif [ "$ARCH" = "arm64" ]; then XARCH="arm64-v8a"; \
     else XARCH="64"; fi && \
-    wget -q "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${XARCH}.zip" \
+    wget -q --dns-timeout=5 --connect-timeout=10 \
+         "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${XARCH}.zip" \
          -O /tmp/xray.zip && \
     unzip -q /tmp/xray.zip -d /tmp/xray && \
     mv /tmp/xray/xray /usr/local/bin/xray && \
@@ -32,7 +29,9 @@ RUN pip install --no-cache-dir aiohttp aiohttp-socks geoip2
 RUN mkdir -p /usr/share/GeoIP
 
 # Скачиваем базу GeoLite2-Country (с официального зеркала)
-RUN wget -q https://git.io/GeoLite2-Country.mmdb -O /usr/share/GeoIP/GeoLite2-Country.mmdb
+RUN wget -q --dns-timeout=5 --connect-timeout=10 \
+         https://git.io/GeoLite2-Country.mmdb \
+         -O /usr/share/GeoIP/GeoLite2-Country.mmdb
 
 
 # Папка для результатов
