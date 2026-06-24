@@ -3,9 +3,13 @@ services:
     build: .
     container_name: vpn-runner
     restart: unless-stopped
-    # Пробрасываем порт для cloudflared
+    # API port + Bridge Shadowsocks port + upstream SOCKS ports
     ports:
-      - "29000:29000"
+      - "29000:29000"   # API
+      - "8443:8443"     # Bridge Shadowsocks
+      - "11080:11080"   # Upstream SOCKS 0
+      - "11081:11081"   # Upstream SOCKS 1
+      - "11082:11082"   # Upstream SOCKS 2
     volumes:
       - ./data:/data
     environment:
@@ -14,12 +18,6 @@ services:
       RUN_INTERVAL: "3600"
       OUTPUT_DIR: "/data"
       API_PORT: "29000"
-    # dns:
-      # - 77.88.8.8
-      # - 8.8.8.8
-    # sysctls:
-    #   - net.ipv6.conf.all.disable_ipv6=1
-    #   - net.ipv6.conf.default.disable_ipv6=1
     security_opt:
       - no-new-privileges:false
     cap_add:
@@ -27,15 +25,6 @@ services:
     networks:
       - vpn-network
 
-  # localtunnel:
-  #   image: node:18-alpine
-  #   container_name: localtunnel
-  #   restart: unless-stopped
-  #   command: npx localtunnel --port 29000 --host https://localtunnel.me
-  #   depends_on:
-  #     - vpn-runner
-  #   networks:
-  #     - vpn-network
-    # Не нужно пробрасывать порты, localtunnel сам создает публичный URL
-
-network_mode: "host"
+networks:
+  vpn-network:
+    driver: bridge

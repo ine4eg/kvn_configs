@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Устанавливаем xray
-ARG XRAY_VERSION=1.8.24
+ARG XRAY_VERSION=26.3.27
 ARG TARGETARCH=amd64
 RUN ARCH=${TARGETARCH} && \
     if [ "$ARCH" = "amd64" ]; then XARCH="64"; \
@@ -35,7 +35,7 @@ RUN wget -q https://git.io/GeoLite2-Country.mmdb -O /usr/share/GeoIP/GeoLite2-Co
 RUN mkdir -p /data
 
 WORKDIR /app
-COPY runner.py .
+COPY runner.py bridge.py .
 
 # Переменные окружения (можно переопределить в docker run / compose)
 ENV CONFIG_URL="https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt"
