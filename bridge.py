@@ -22,7 +22,7 @@ except ImportError:
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BRIDGE_IP          = "0.0.0.0"
+BRIDGE_IP          = "95.165.137.180"
 BRIDGE_PORT        = 8443
 BRIDGE_POOL_SIZE   = 3
 BRIDGE_SOCKS_PORTS = [11080, 11081, 11082]
