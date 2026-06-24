@@ -338,6 +338,7 @@ class BridgeManager:
     async def health_check_loop(self):
         """Основной цикл health-check: ping 5с, speed 60с, лог 5с."""
         slot_health = {0: False, 1: False, 2: False}
+        slot_speed_ok = {0: False, 1: False, 2: False}  # True если upstream прошёл speed-test
         speed_tester = None
         last_speed_check = time.time()
 
@@ -387,35 +388,53 @@ class BridgeManager:
                                 label = _get_label(new_uri) if _get_label else ""
                                 _l(f"[bridge-hc] Upstream [{idx}] перетестирован: {str(label)[:60]}")
                                 self._speed_mbps[idx] = _extract_download_mbps(new_uri)
+                                slot_speed_ok[idx] = True
                             else:
+                                slot_speed_ok[idx] = False
                                 _l(f"[bridge-hc] Upstream [{idx}] не прошёл speed-test → пополняем")
                                 replenished = await self._replenish_slot(idx)
                                 if not replenished:
                                     _l(f"[bridge-hc] Не удалось пополнить слот [{idx}]")
                         except Exception as e:
+                            slot_speed_ok[idx] = False
                             _l(f"[bridge-hc] Ошибка ре-теста upstream [{idx}]: {e}")
 
-                # ── failover: если активный упал, переключаемся ───────────
+
+                # ── failover: если активный упал или не прошёл speed-test ──
                 active = self._bridge_state['active_idx']
                 active_proc = self._bridge_state['upstream_procs'][active]
                 active_dead = (active_proc is None
                                or active_proc.poll() is not None
-                               or not slot_health.get(active, False))
+                               or not slot_health.get(active, False)
+                               or not slot_speed_ok.get(active, False))
 
                 if active_dead:
                     _l(f"[bridge] ⚠️ Active upstream [{active}] не отвечает!")
 
                     switched = False
+                    # Сначала пробуем здоровые и быстрые бэкапы
                     for i in range(BRIDGE_POOL_SIZE):
                         if i == active:
                             continue
-                        if slot_health.get(i, False):
+                        if slot_health.get(i, False) and slot_speed_ok.get(i, False):
                             await self._switch_to(i)
                             switched = True
                             break
 
+                    # Если нет быстрых, пробуем просто здоровые
+                    if not switched:
+                        for i in range(BRIDGE_POOL_SIZE):
+                            if i == active:
+                                continue
+                            if slot_health.get(i, False):
+                                await self._switch_to(i)
+                                switched = True
+                                break
+
+                    # Пополняем упавший слот
                     await self._replenish_slot(active)
 
+                    # Всё ещё не переключились — берём любой живой
                     if not switched:
                         for i in range(BRIDGE_POOL_SIZE):
                             if slot_health.get(i, False):
