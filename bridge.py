@@ -32,7 +32,7 @@ SS_METHOD          = "chacha20-ietf-poly1305"
 SS_PASSWORD        = hashlib.md5(b"self-hosted-ru-bridge").hexdigest()  # deterministic 32-char
 
 HEALTH_CHECK_INTERVAL = 5  # секунд
-SPEED_RECHECK_INTERVAL = 60  # секунд — перетестировать скорость
+SPEED_RECHECK_INTERVAL = 240  # секунд — перетестировать скорость
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
