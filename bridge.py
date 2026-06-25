@@ -203,8 +203,10 @@ class BridgeManager:
     def _select_pool(self, top3):
         """Собрать пул из 3-х лучших конфигов, заполнив пустые слоты."""
         pool = [None, None, None]
+        # Отфильтровать RU конфиги из top3
         for i, uri in enumerate(top3[:3]):
-            pool[i] = uri
+            if _is_non_ru_config(uri):
+                pool[i] = uri
 
         tested = _get_all_real_configs()
         used   = {u for u in pool if u is not None}
